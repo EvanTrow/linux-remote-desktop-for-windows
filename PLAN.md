@@ -25,23 +25,112 @@ This is a **from-scratch custom protocol**, not a FreeRDP fork — we're intenti
 - **Audio**: host → client playback (system/app audio), not client → host (no mic requirement stated).
 - **Clipboard**: bidirectional text, images, and files.
 
-## Known unknowns — resolve before committing to an architecture
+## Known unknowns — Phase 0 findings (resolved 2026-08-11)
 
-These weren't established in the planning conversation and materially change the design. Phase 0 exists to answer
-them:
+These weren't established in the planning conversation and materially changed the design. Findings below; the
+resulting architecture changes are folded into the sections after this one.
 
-1. **What GPU (if any) does the Windows host have?** Determines whether hardware encode (NVENC/QuickSync/AMF) is
-   available or whether we're stuck with CPU (x264) encode, which changes the achievable resolution/framerate/latency
-   budget.
-2. **Windows version on the host** — affects which capture API is available (Desktop Duplication API vs. the newer
-   Windows.Graphics.Capture) and virtual-display-driver signing requirements.
-3. **Network path** — is this pure LAN, or does it ever need to work over VPN/WAN? Affects transport/congestion
-   control choices and whether NAT traversal matters at all.
-4. **Auth/security model** — the current setup rides on Azure AD auth built into RDP (`/sec:aad`). A custom
-   protocol has no equivalent for free; needs an explicit replacement (see Security section).
-5. **Windows driver signing** — same class of problem we just hit on the Linux side with secure boot / MOK
-   enrollment: an unsigned custom Indirect Display Driver (IDD) on the host will need either test-signing mode
-   enabled or reuse of an already-signed community IDD.
+1. **Host GPU / hardware encode.** Not pinned down — the host (`cwtrow`, 192.168.1.55) is only reachable over
+   RDP (port 3389; no SSH/WinRM open), so it can't be queried directly without an interactive AAD login, and the
+   explicit direction from this discussion is to **not** hardcode to specific hardware anyway: the encoder must be
+   auto-detected at runtime on whatever host it happens to run on. Resolution: use Media Foundation's `MFTEnumEx`
+   (category `MFT_CATEGORY_VIDEO_ENCODER`) to enumerate available hardware encoder MFTs at startup, try in priority
+   order NVENC → Quick Sync (MFX/VPL) → AMF → software x264, and log whichever was selected. No blocking unknown
+   left — this is now a design requirement, not a research question.
+2. **Windows version on the host — confirmed Windows 11.** This settles the capture-API question (below).
+3. **Network path — confirmed LAN-only, single-user**, per this discussion. No NAT traversal, no roaming, no WAN
+   fallback needed. This directly informed the transport decision below.
+4. **Auth/security model** — unchanged from the original plan: QUIC/TLS with a pre-shared client certificate.
+   Not revisited in this Phase 0 pass.
+5. **Windows driver signing** — resolved by reusing an already-signed community IDD rather than writing one; see
+   "Virtual display driver" below. No test-signing mode needed on the host.
+
+### Capture API — Desktop Duplication API, not Windows.Graphics.Capture
+
+Windows 11 makes both available, but DDA wins for this use case:
+
+- **WGC's yellow capture-indicator border is disqualifying here.** For virtual/headless monitors, the *only*
+  viewer of that output is our own client — the border isn't a harmless on-screen hint on a monitor someone's
+  looking at, it gets composited straight into the stream. Suppressing it (`IsBorderRequired = false`) requires
+  MSIX package identity and a one-time user-consent prompt (`GraphicsCaptureAccess.RequestAccessAsync` with
+  `GraphicsCaptureAccessKind.Borderless`) — real friction for a background Win32 agent.
+- **DDA is the same choice Sunshine makes** for the identical IDD-capture-encode pipeline, which is a good proxy
+  for "this combination is well-trodden in practice."
+- DDA's GPU-affinity requirement (capturing app must run on the same adapter driving the display) isn't a problem
+  since this is a single-GPU host and the IDD-created virtual monitors are driven by that same adapter.
+- WGC's main advantage (cross-GPU capture with no setup) isn't needed here.
+
+Decision: capture each synthetic monitor via `IDXGIOutputDuplication` (DDA), one duplication session per virtual
+monitor.
+
+### Virtual display driver — reuse, don't write one
+
+[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) (successor to
+itsmikethetech's original, MIT-licensed) fits the "3 virtual monitors matching client topology" requirement almost
+exactly:
+
+- Signed via SignPath (free open-source code signing) — installs cleanly on Windows 11 without test-signing mode.
+- Supports arbitrary custom resolutions/refresh rates per virtual monitor (640×480 up to 8K, refresh rates
+  including odd ones), configured via `vdd_settings.xml` plus a `qres`-based CLI path for changing resolution at
+  runtime — this is exactly the hook the host agent needs to reconfigure monitors on topology-negotiation from the
+  client, without touching driver code.
+- Already has a documented Sunshine integration path (`SunshineIntegration.bat` + `qres`) that does the same
+  "set virtual monitor resolution to match what the remote client just told me" job we need — good template to
+  copy rather than design from scratch.
+- Known caveat: a still-open issue on Windows 11 24H2/25H2 where an IDD virtual display can't be set as the
+  **primary** display (desktop mode doesn't apply until the user manually touches the refresh-rate dropdown in
+  Settings). Doesn't block us — none of the 3 virtual monitors need to be primary — but worth re-testing once the
+  host agent exists, since a real physical/RDP-session default display still needs to exist for the host to boot
+  headless.
+
+Decision: build on this driver instead of writing a custom IddCx implementation. Revisit only if the runtime
+resolution-change path proves too slow/unreliable for topology renegotiation in practice.
+
+### Decode-to-scanout on GNOME/Wayland — achievable, no DRM lease needed
+
+The client's actual Mutter version (GNOME Shell 50.3) is well past the relevant fix: GNOME 49 landed improved
+direct-scanout handling for fullscreen dmabuf/YUV surfaces via `wp_viewporter` (opaque-format substitution on the
+primary plane), meaning a fullscreen video-shaped surface can hit the direct scanout path without the compositor
+ever compositing it through the 3D engine. Mutter's DRM lease protocol support (which would allow bypassing the
+compositor's output entirely) is still a draft/WIP merge request — not something to depend on.
+
+Practical approach: present each monitor's decoded frame as a fullscreen `wl_surface` using YUV dma-buf import,
+sized/scaled via `wp_viewporter`, and avoid anything that forces compositing (no blur/shadow/rounded-corner
+effects on that surface, true unredirected fullscreen). This should get close to decode-to-scanout without needing
+a dedicated DRM-lease/session-takeover path — worth a small Phase 1 spike to confirm in practice, but no longer an
+open architectural question.
+
+**Blocking gap found on this client, not a Wayland problem**: NVIDIA doesn't expose VA-API natively — decode via
+VAAPI requires the `nvidia-vaapi-driver` shim (upstream project: elFarto/nvidia-vaapi-driver), packaged for
+Nobara's own repos (not RPM Fusion) as `libva-nvidia-driver` (confirmed available: `libva-nvidia-driver-0.0.17-1.fc44`
+via `dnf list --available`). **Not currently installed** on this machine — `rpm -qa` shows no VAAPI packages and no `vainfo` binary.
+Driver 610.57.04 is well past the versions that introduced (555.58) and stabilized (580.x) explicit sync on
+Wayland via `linux-drm-syncobj-v1`, so no explicit-sync concerns. Action item for Phase 1: `dnf install
+libva-nvidia-driver` before attempting the decode spike.
+
+### Transport — reconsidered: still QUIC, but datagrams for media, not streams
+
+The original plan's "QUIC, per-monitor streams for video" needs one correction. Research into QUIC-for-real-time-media
+turned up a specific, well-documented problem: QUIC's default congestion control (NewReno in most implementations)
+actively fights an application-level real-time congestion controller — bitrate oscillates as the two controllers
+react to each other, and it gets materially worse under any real congestion. This is very likely *why* the
+established prior art here (Moonlight/Sunshine, Parsec) all use raw/custom UDP protocols instead of QUIC or TCP for
+their video path, not an oversight on their part.
+
+Two options considered:
+- **Drop QUIC entirely**, go TCP (control) + raw UDP with custom framing (media), matching Moonlight/Sunshine/Parsec
+  exactly. Most latency-predictable, most implementation work (custom framing, ordering, loss handling, and our own
+  encryption layer since we lose "TLS for free").
+- **Keep QUIC, but move video/audio onto QUIC unreliable datagrams (RFC 9221) instead of streams**, and keep
+  reliable ordered streams only for control/clipboard/file-transfer. This sidesteps the specific problem (stream
+  retransmission head-of-line-blocking) without losing single-connection/single-library/TLS-for-free simplicity.
+
+Decision: **keep QUIC via `quinn`** (pure Rust, mature, has first-class datagram support — `msquic`'s Rust bindings
+are comparatively immature, and pure-Rust avoids an FFI/build-complexity tax on both host and client). Send
+video/audio over datagrams, not streams. Given the confirmed LAN-only/single-user scope, default congestion control
+is very unlikely to be a real bottleneck (LAN bandwidth headroom vs. our target bitrate is large) — leave it on
+defaults for the Phase 1 MVP and only invest in a custom/pluggable congestion controller if benchmarking against
+`xfreerdp` in Phase 1 shows it's actually limiting.
 
 ## Architecture
 
@@ -58,8 +147,8 @@ Two independent applications, talking a custom protocol over the LAN:
 │  (Desktop Duplication)   │                      │  (fullscreen, borderless)│
 │         │                │                      │         ▲                │
 │         ▼                │                      │         │                │
-│  HW encode (NVENC/QSV/   │── video (unreliable, │  HW decode (VAAPI/NVDEC) │
-│   AMF, else x264)        │   per-monitor stream)│         │                │
+│  HW encode (auto-detect: │── video (unreliable, │  HW decode (VAAPI via    │
+│   NVENC/QSV/AMF/x264)    │  per-monitor datagram)│  nvidia-vaapi-driver)   │
 │                          │                      │                          │
 │  WASAPI loopback         │── audio (unreliable) ►  PipeWire playback       │
 │  → Opus encode           │                      │                          │
@@ -73,36 +162,42 @@ Two independent applications, talking a custom protocol over the LAN:
 
 ### Transport
 
-Recommend **QUIC** (via `quinn` if we go Rust, or `msquic` which has first-class Windows + cross-platform support)
-as the single transport:
+**QUIC via `quinn`** (pure Rust) as the single transport — see "Transport — reconsidered" under Phase 0 findings
+above for the full reasoning:
 
-- One QUIC connection, multiple streams: a reliable control stream (handshake, topology negotiation, clipboard,
-  file transfer) and either QUIC datagrams or dedicated unreliable-ish streams per monitor for video, plus one for
-  audio.
+- One QUIC connection: reliable ordered streams for control (handshake, topology negotiation, clipboard, file
+  transfer), unreliable **datagrams** (RFC 9221, not streams) for per-monitor video and for audio, to avoid
+  stream-retransmission head-of-line-blocking fighting the real-time bitrate.
 - Gets us encryption (TLS 1.3 is mandatory in QUIC) "for free" — solves part of the auth/security gap left by
   dropping AAD.
-- If QUIC proves to add too much complexity for the MVP, fall back to plain UDP (video/audio, custom lightweight
-  framing) + TCP (control/clipboard) — simpler to debug, worse head-of-line-blocking characteristics.
+- `quinn` over `msquic`: pure Rust, no FFI/build tax on either host or client, more mature Rust bindings.
+- Default congestion control to start; revisit only if Phase 1 benchmarking shows it's limiting on the LAN.
 
 ### Video pipeline
 
 - **Per-monitor stream**, not one giant composited canvas — keeps encode/decode resolution sane (avoids ever
   needing to encode a single 5120+2560+1920-wide frame) and lets each monitor's stream independently adapt
   bitrate/framerate to its content.
-- Host: capture via Desktop Duplication API (per synthetic monitor) → hardware encoder (NVENC preferred; confirm
-  availability in Phase 0) → H.264 or AV1 depending on encoder support and client decode capability.
-- Client: hardware decode (VAAPI on the RTX 4070 Ti works fine for decode regardless of the encode source) → present
-  directly to the relevant monitor's surface with minimal buffering (target: decode-to-scanout, not decode-to-
-  compositor-to-scanout, if achievable under Wayland/GNOME — needs a Phase 0/1 spike, may require DRM lease or a
-  dedicated fullscreen-unredirected path).
+- Host: capture via **Desktop Duplication API** (per synthetic monitor — confirmed over Windows.Graphics.Capture,
+  see Phase 0 findings) → hardware encoder, auto-detected at runtime via Media Foundation `MFTEnumEx` in priority
+  order NVENC → Quick Sync → AMF → software x264 fallback → H.264 or AV1 depending on encoder support and client
+  decode capability.
+- Client: hardware decode (VAAPI — requires the `nvidia-vaapi-driver` shim on NVIDIA, packaged as
+  `libva-nvidia-driver` in Nobara's repos; **not yet installed on this client**, install before the Phase 1
+  decode spike) → present directly to the relevant monitor's surface with minimal buffering. Decode-to-scanout is
+  achievable via a fullscreen `wl_surface` + YUV dma-buf + `wp_viewporter`, riding Mutter's GNOME 49+ direct-scanout
+  path (confirmed present on this client's GNOME Shell 50.3) — no DRM lease needed (still WIP in Mutter). See Phase
+  0 findings for detail; still worth a small Phase 1 spike to confirm in practice.
 
 ### Display topology negotiation
 
 On connect, client enumerates its outputs (resolution, position, refresh rate, DPI) and sends them to the host. Host
 driver creates/reconfigures 3 virtual monitors to match. This is the same problem `/multimon` already solves in RDP
-— we're reimplementing it, not inventing new UX behavior. Windows IDD (Indirect Display Driver) frameworks that
-already support dynamic resolution/topology changes should be evaluated before writing one from scratch — reuse
-over reinvention here.
+— we're reimplementing it, not inventing new UX behavior. Reuse over reinvention: build on
+[VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) (MIT, signed,
+Windows 10/11) rather than writing a custom IddCx driver — see Phase 0 findings above for why and its runtime
+resolution-change hook (`vdd_settings.xml` + `qres`-based CLI, same mechanism it already uses for Sunshine
+integration).
 
 ### Clipboard & file transfer
 
@@ -119,8 +214,8 @@ enterprise deployment), recommend the simplest thing that isn't actually insecur
 
 - QUIC/TLS with a pre-shared client certificate (host only accepts connections presenting a specific cert we
   provision once) — avoids building any kind of account/password system.
-- Alternative if WAN access is ever needed (see open unknown #3): tunnel over WireGuard and trust the tunnel,
-  skip app-level auth entirely.
+- Alternative if WAN access is ever needed later (network path is confirmed LAN-only for now — see Phase 0
+  findings #3): tunnel over WireGuard and trust the tunnel, skip app-level auth entirely.
 
 ## Suggested tech stack
 
@@ -131,9 +226,12 @@ C++ is the fallback if a specific Windows capture/IDD API turns out to need it a
 
 ## Phased plan
 
-- **Phase 0 — Research spike (no shippable code)**: answer the "known unknowns" above. Confirm host GPU/encoder
-  capability, pick a Windows capture API, evaluate existing IDD projects for the virtual multi-monitor requirement,
-  decide QUIC vs TCP+UDP, benchmark decode-to-scanout latency achievability on GNOME/Wayland.
+- **Phase 0 — Research spike (no shippable code) — DONE (2026-08-11)**: see "Known unknowns — Phase 0 findings"
+  above. Encoder is a runtime auto-detect (no host GPU assumption needed), capture API is Desktop Duplication API,
+  IDD reuses VirtualDrivers/Virtual-Display-Driver, transport is QUIC/`quinn` with datagrams for media, and
+  decode-to-scanout looks achievable on this client's Mutter version without a DRM lease. Two concrete carry-overs
+  into Phase 1: install `libva-nvidia-driver` on the client (missing — VAAPI decode won't work without it), and
+  spike the fullscreen-dmabuf-scanout path to confirm it in practice rather than just on paper.
 - **Phase 1 — Single-monitor MVP**: host streams one virtual/real display, client shows it fullscreen on one
   monitor, keyboard/mouse input works. Benchmark latency against current `xfreerdp` setup as the go/no-go gate for
   continuing.
