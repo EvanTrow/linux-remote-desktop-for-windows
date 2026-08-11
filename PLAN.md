@@ -217,6 +217,121 @@ enterprise deployment), recommend the simplest thing that isn't actually insecur
 - Alternative if WAN access is ever needed later (network path is confirmed LAN-only for now — see Phase 0
   findings #3): tunnel over WireGuard and trust the tunnel, skip app-level auth entirely.
 
+## Phase 1 findings — decode-to-scanout spike (2026-08-11)
+
+The Phase 0 assessment that decode-to-scanout is "achievable, no DRM lease needed" was based on Mutter's
+compositor-side support (confirmed present) but didn't account for a **driver-side gap specific to this NVIDIA
+setup**: dma-buf/DRM-prime export from a VAAPI decode surface does not currently work with
+`libva-nvidia-driver` 0.0.17 (elFarto/nvidia-vaapi-driver, latest upstream release) + NVIDIA driver 610.57.04 on
+this RTX 4070 Ti.
+
+Confirmed via three independent code paths, all failing the same underlying operation:
+- **GStreamer** (`va` plugin, `vah264dec`): negotiating `video/x-raw(memory:DMABuf)` fails outright — the decoder's
+  dynamic caps never advertise the DMABuf memory feature for this backend. Plain `waylandsink` silently falls back
+  to SHM (system-memory copy) buffers, which by construction can never be scanned out — confirmed via `drm_info`
+  plane snapshots (primary plane stayed at desktop XR24/XB24 format and desktop resolution throughout playback,
+  never switched to NV12 at video resolution).
+- **mpv** (`--vo=dmabuf-wayland --hwdec=vaapi`): surface-format probing fails for every format (NV12, P010, P012,
+  YUV444P) with `vaExportSurfaceHandle() failed (invalid VASurfaceID)`, falls back to `drmprime` hwdec, which also
+  fails, ultimately aborting with no video decoded at all.
+- **ffmpeg** (`-vf hwmap=derive_device=drm`, i.e. `av_hwdevice_ctx_create_derived`): fails with
+  `-38 Function not implemented`.
+
+This isn't a KMS/atomic-modesetting problem (confirmed working independently via `drm_info` — full plane/CRTC/
+connector enumeration succeeds, `nvidia-drm.modeset` is on, as it must be for this Wayland session to run at all)
+and it isn't a stale-driver problem (0.0.17 is the current upstream release). Plain VAAPI decode itself works fine
+(`vainfo` lists full H.264/HEVC/AV1/VP9 VLD decode entrypoints, GStreamer's `vah264dec` decodes correctly to NV12)
+— only the surface **export** step (`vaExportSurfaceHandle`, needed to hand the decoded frame to Wayland as a
+dma-buf for `zwp_linux_dmabuf_v1` / direct scanout) fails.
+
+**Resolution for Phase 1 MVP**: don't block on this. Use hardware-accelerated VAAPI decode + **composited**
+presentation (copy decoded NV12 frame back to system memory / SHM, as GStreamer's `waylandsink` already does
+successfully) rather than true unredirected direct scanout. This still gets HW decode acceleration for the
+expensive part (H.264/HEVC/AV1 decode), costs one memcpy per frame (~3MB for 1080p60, cheap on modern hardware),
+and is a proven-working path (confirmed via the `waylandsink` SHM fallback actually presenting frames). True
+decode-to-scanout becomes a stretch optimization for a later phase (revisit once end-to-end latency is measured
+against `xfreerdp-aad` — if composited presentation already meets the performance bar, direct scanout may not be
+worth the yak-shave). Track the underlying export bug upstream against elFarto/nvidia-vaapi-driver separately.
+
+## Phase 1 findings — Session 0 isolation blocks SSH-launched capture (2026-08-11)
+
+First live end-to-end test (real client on this Linux machine, real host on cwtrow over the LAN)
+got through the full QUIC handshake and control-plane exchange (`ClientHello`/`ServerHello`,
+`Topology`/`TopologyAck`) successfully, then `IDXGIOutputDuplication::DuplicateOutput` failed with
+`DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` (0x887A0022). Root cause: the host process was launched via
+SSH, and Windows' OpenSSH server runs as a service — anything it spawns lands in **Session 0**
+(`Get-Process` showed `SI 0`), which has no attached display by design (Session 0 isolation, since
+Vista). DDA (and `SendInput`/input injection) fundamentally require running in an interactive
+session (the console session, or an RDP session), not Session 0.
+
+This is a testing-methodology artifact of using raw SSH exec, not a code defect — but it points at
+a real Phase 5 packaging requirement: a production host agent needs the well-known
+service-launches-into-interactive-session pattern (`WTSQueryUserToken` + `CreateProcessAsUser`,
+same approach Sunshine/Parsec use) rather than running as a plain SSH-spawned or Session-0 service
+process. Deferred to Phase 5 ("host as a Windows service/startup app") per the existing phase plan
+— not a Phase 1 blocker, just means **Phase 1 testing needs the host binary launched from within an
+actual interactive session** (the existing RDP session, or the console), not over SSH.
+
+**Follow-up (2026-08-11, later same day) — confirms it's specifically about the console/physical
+session, not just "any interactive session":** running the host from within a separate Windows RDP
+session (`rdp-tcp#0`, a distinct logical session from the console) got past Session-0 isolation but
+DDA still failed (`IMFActivate::ActivateObject` / capture errors depending on which encoder). It only
+started working once the host was launched while the user was connected through the **network KVM**
+(mirroring the actual physical/console session, session 1) — confirmed by real encoded H.264
+datagrams arriving at the client. Once that KVM connection was closed, frames stopped again (console
+session no longer has an active interactive user). This matches the DDA/Sunshine-style constraint
+exactly: capture requires an active, unlocked **console** session specifically, not just any
+interactive Windows session. Reinforces the Phase 5 auto-logon-or-service-launch requirement noted
+above — for now, Phase 1 testing needs the KVM (or console) connection held open, not the separate
+RDP session.
+
+Also found and fixed two real bugs surfaced by this same test, both in the Media Foundation encode
+path (`host/src/encode.rs`): (1) encoder auto-detection now falls through to the next candidate on
+`ActivateObject`/`SetInputType` failure instead of hard-failing on the first pick — needed in
+practice since this host's Quick Sync MFT fails to activate and its AMD MFT is async-only (neither
+of which `MFTEnumEx` surfaces up front); and (2) `ProcessOutput` needs a caller-allocated output
+sample when the MFT doesn't set `MFT_OUTPUT_STREAM_PROVIDES_SAMPLES`, which the software H.264
+Encoder MFT (the working fallback) requires — omitting it produced `E_INVALIDARG` on every frame and,
+once the encoder's internal buffer backed up from never being drained, cascading `ProcessInput`
+failures too.
+
+## Phase 1 findings — client decode/present working end-to-end (2026-08-11)
+
+Built the client side (`client/src/decode.rs`): `gstreamer-rs` with an `appsrc` fed from reassembled
+QUIC datagrams, `h264parse ! vah264dec ! waylandsink` (composited presentation, per the earlier
+decode-to-scanout finding), `queue` added between `appsrc` and `h264parse` per GStreamer's own
+"add queues" warning for live sources. Confirmed the host's H.264 output is Annex-B byte-stream
+(`00 00 00 01` start codes) by inspecting real captured bytes rather than guessing.
+
+Hit and fixed three more real bugs before getting a picture on screen, in order:
+1. **No periodic keyframes.** The encoder only emitted its first IDR/SPS/PPS at startup; any client
+   connecting later (or any datagram loss) had no reference frame to decode against. Fixed by
+   setting `MF_MT_MAX_KEYFRAME_SPACING` to force a keyframe every ~2s.
+2. **Resolution mismatch (false lead, but a real bug worth keeping fixed).** Encoder media types
+   were hardcoded to 1920x1080. A diagnostic query for the "real" resolution returned 1024x768, but
+   that was measured from a *different, non-interactive SSH session* than the one actually running
+   DDA — `System.Windows.Forms.Screen` reports a fallback size for sessions with no real attached
+   display. The true console-session resolution genuinely was 1920x1080, so this wasn't the black-
+   screen cause — but hardcoding was still wrong in principle, so `capture.rs` now queries the real
+   resolution via `IDXGIOutput::GetDesc()` from within the actual capturing process/session, which
+   self-corrects regardless of what any external diagnostic reports.
+3. **The real cause: `ReleaseFrame()` called before the CPU actually read the data.** The original
+   capture path did `CopyResource` (source → intermediate texture) → `Flush()` → `ReleaseFrame()`,
+   then read the intermediate texture *later*, in a separate function call. `Flush()` only submits
+   queued GPU work, it does not wait for completion — so `ReleaseFrame()` could let DDA reclaim the
+   source texture before the copy actually executed on the GPU, and the later read consistently came
+   back as all-zero (confirmed via raw-byte diagnostics: `min=max=avg=0` across 10 consecutive
+   frames, with active window drags happening on screen). Fixed by consolidating to a single
+   DDA-source → staging-texture copy, with the actual `Map()`-based CPU read (the real
+   synchronization point) happening *before* `ReleaseFrame()` — not just before a `Flush()`. Also
+   ruled out in the process: multi-GPU/wrong-adapter selection (this host has only one real
+   adapter+output, `AMD Radeon(TM) Graphics` / `\\.\DISPLAY1`, confirmed via full `IDXGIFactory1`
+   enumeration) and HDR/Advanced-Color format mismatch (confirmed `desc.Format` is
+   `DXGI_FORMAT_B8G8R8A8_UNORM` as assumed).
+
+End-to-end confirmed working: real screen content captured on cwtrow, encoded, streamed over QUIC,
+decoded via VAAPI, and displayed fullscreen on this client's DP-2 monitor.
+
 ## Suggested tech stack
 
 **Rust** for both sides is the recommendation: one language across host (Windows) and client (Linux), strong crates

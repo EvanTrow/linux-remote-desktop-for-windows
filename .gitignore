@@ -1,0 +1,19 @@
+# Build artifacts
+/target
+**/target/
+
+# Cargo.lock: commit for binary crates (client, host), ignore for library
+# crates (netcommon, proto) per Rust convention.
+netcommon/Cargo.lock
+proto/Cargo.lock
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Secrets - never commit
+.ssh/
