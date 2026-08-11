@@ -347,9 +347,13 @@ C++ is the fallback if a specific Windows capture/IDD API turns out to need it a
   decode-to-scanout looks achievable on this client's Mutter version without a DRM lease. Two concrete carry-overs
   into Phase 1: install `libva-nvidia-driver` on the client (missing — VAAPI decode won't work without it), and
   spike the fullscreen-dmabuf-scanout path to confirm it in practice rather than just on paper.
-- **Phase 1 — Single-monitor MVP**: host streams one virtual/real display, client shows it fullscreen on one
-  monitor, keyboard/mouse input works. Benchmark latency against current `xfreerdp` setup as the go/no-go gate for
-  continuing.
+- **Phase 1 — Single-monitor MVP — streaming + input DONE (2026-08-11), benchmark pending**: host streams one
+  real display, client shows it fullscreen on one monitor (confirmed working end-to-end on real hardware — see
+  Phase 1 findings above), keyboard/mouse input works (real evdev capture on the client forwarding relative mouse
+  motion + key events to `SendInput` on the host; requires the client's running user to be in the Linux `input`
+  group for `/dev/input/event*` access, not exclusive-grabbed for now — input still reaches the local desktop too,
+  see `client/src/input_capture.rs`). Still open: benchmark latency against current `xfreerdp-aad` setup as the
+  go/no-go gate for continuing to Phase 2.
 - **Phase 2 — Multi-monitor**: extend to 3 synthetic host monitors matching client topology exactly, independent
   per-monitor streams.
 - **Phase 3 — Audio**: WASAPI loopback → Opus → PipeWire playback.

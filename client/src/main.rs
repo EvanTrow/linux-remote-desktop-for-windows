@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use tracing::{info, warn};
 
 mod decode;
+mod input_capture;
 
 /// Linux client for the custom remote desktop protocol. Phase 1 MVP: single monitor,
 /// no clipboard/audio. Connects to the host agent over QUIC, negotiates topology, then
@@ -20,10 +21,16 @@ struct Args {
     #[arg(long)]
     fingerprint: String,
 
-    /// Send a canned sequence of mouse/keyboard events after connecting, to smoke-test
-    /// SendInput injection on the host before the real evdev capture path (task 10) exists.
+    /// Send a canned sequence of mouse/keyboard events after connecting — a smoke test for
+    /// SendInput injection independent of local input devices/permissions.
     #[arg(long)]
     test_input: bool,
+
+    /// Capture real local keyboard/mouse via evdev and forward it to the host. Not exclusive
+    /// (input still reaches the local desktop too — see input_capture.rs). Requires the
+    /// running user to be in the `input` group.
+    #[arg(long)]
+    capture_input: bool,
 
     /// Wayland output to present fullscreen on (e.g. "DP-2"). Defaults to the compositor's
     /// choice if unset. Phase 1 MVP targets a single monitor.
@@ -95,6 +102,20 @@ async fn main() -> Result<()> {
         send_test_input(&mut send).await?;
     }
 
+    if args.capture_input {
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let count = input_capture::spawn_all(input_tx)?;
+        info!(devices = count, "input capture started");
+        tokio::spawn(async move {
+            while let Some(event) = input_rx.recv().await {
+                if let Err(e) = send_control(&mut send, &ControlMessage::Input(event)).await {
+                    warn!(error = %e, "failed to forward input event, stopping capture");
+                    break;
+                }
+            }
+        });
+    }
+
     video_task.await??;
     Ok(())
 }
@@ -106,9 +127,9 @@ async fn send_test_input(send: &mut quinn::SendStream) -> Result<()> {
     use tokio::time::{sleep, Duration};
 
     info!("sending test input sequence");
-    let moves = [(200, 200), (400, 200), (400, 400), (200, 400), (200, 200)];
-    for (x, y) in moves {
-        send_control(send, &ControlMessage::Input(InputEvent::MouseMove { x, y })).await?;
+    let moves = [(200, 0), (0, 200), (-200, 0), (0, -200)];
+    for (dx, dy) in moves {
+        send_control(send, &ControlMessage::Input(InputEvent::MouseMove { dx, dy })).await?;
         sleep(Duration::from_millis(300)).await;
     }
     send_control(

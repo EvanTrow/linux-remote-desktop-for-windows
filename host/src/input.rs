@@ -4,12 +4,11 @@ use anyhow::{Context, Result};
 use rdproto::{ControlMessage, InputEvent, MouseButton};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
     MOUSE_EVENT_FLAGS,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
 pub async fn run(mut recv: quinn::RecvStream) -> Result<()> {
     loop {
@@ -26,15 +25,7 @@ pub async fn run(mut recv: quinn::RecvStream) -> Result<()> {
 
 fn inject(event: InputEvent) -> Result<()> {
     let input = match event {
-        InputEvent::MouseMove { x, y } => {
-            // Phase 1 MVP: single monitor, so absolute coordinates map 1:1 to the primary
-            // screen's own resolution scale. Multi-monitor coordinate mapping is Phase 2.
-            let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-            let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-            let norm_x = (x as f32 / screen_w.max(1) as f32 * 65535.0) as i32;
-            let norm_y = (y as f32 / screen_h.max(1) as f32 * 65535.0) as i32;
-            mouse_input(norm_x, norm_y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0)
-        }
+        InputEvent::MouseMove { dx, dy } => mouse_input(dx, dy, MOUSEEVENTF_MOVE, 0),
         InputEvent::MouseButton { button, pressed } => {
             let flags = match (button, pressed) {
                 (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
@@ -48,11 +39,18 @@ fn inject(event: InputEvent) -> Result<()> {
         }
         InputEvent::MouseWheel { delta_y, .. } => mouse_input(0, 0, MOUSEEVENTF_WHEEL, delta_y),
         InputEvent::Key { scancode, pressed } => {
+            // Client encodes extended keys (arrows, ins/del/home/end, right ctrl/alt, win) as
+            // 0xE000 | base_code — see client/src/input_capture.rs.
+            let extended = scancode & 0xE000 == 0xE000;
+            let base_code = scancode & 0xFF;
             let mut flags = KEYEVENTF_SCANCODE;
+            if extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
             if !pressed {
                 flags |= KEYEVENTF_KEYUP;
             }
-            keybd_input(scancode, flags)
+            keybd_input(base_code, flags)
         }
     };
 

@@ -59,7 +59,10 @@ pub struct StreamInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputEvent {
-    MouseMove { x: i32, y: i32 },
+    /// Relative motion delta (matches evdev's `REL_X`/`REL_Y` on the client and
+    /// `SendInput`'s relative `MOUSEEVENTF_MOVE` on the host) — resolution-independent, no
+    /// coordinate-space mapping needed between client and host displays.
+    MouseMove { dx: i32, dy: i32 },
     MouseButton { button: MouseButton, pressed: bool },
     MouseWheel { delta_x: i32, delta_y: i32 },
     Key { scancode: u16, pressed: bool },
