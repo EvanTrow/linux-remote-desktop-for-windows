@@ -1,35 +1,38 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use rdproto::ControlMessage;
-use std::net::SocketAddr;
-use tracing::{info, warn};
+use tracing::info;
 
-mod decode;
-mod input_capture;
-mod input_surface;
+use rdclient::{gamestream, input_surface, pairing, stream};
 
-/// Linux client for the custom remote desktop protocol. Phase 1 MVP: single monitor,
-/// no clipboard/audio. Connects to the host agent over QUIC, negotiates topology, then
-/// streams video (received as datagrams) while forwarding input on the control stream.
+/// Linux client for streaming from a Sunshine host via the Moonlight/GameStream protocol (see
+/// PLAN.md's architecture-pivot section — this replaced an earlier from-scratch QUIC protocol).
+/// Phase 1 MVP scope carries over: single monitor, no clipboard/audio yet.
 #[derive(Parser, Debug)]
 struct Args {
-    /// Host agent address, e.g. 192.168.1.55:5900
+    /// Sunshine host to stream from (bare hostname/IP, no port) — must already be paired (see
+    /// --pair-host) before this will work.
     #[arg(long)]
-    host: SocketAddr,
+    host: Option<String>,
 
-    /// SHA-256 fingerprint of the host's self-signed cert, printed by the host agent on
-    /// first run. Pinned instead of doing full CA-chain validation (see netcommon).
+    /// Sunshine's base port (its `port` config value — offsets its whole port family together,
+    /// see pairing.rs's `Ports`). Multiple monitors mean multiple Sunshine instances on cwtrow,
+    /// each on a different base port (see host/src/topology.rs) — this selects which one.
+    #[arg(long, default_value_t = 47989)]
+    port: u16,
+
+    /// GameStream/Sunshine host to pair with (bare hostname/IP, no port) — see pairing.rs.
+    /// Requires --pair-pin. Exits after pairing; does not stream. One-time setup per host. Uses
+    /// --port same as normal streaming, since each Sunshine instance needs its own pairing.
     #[arg(long)]
-    fingerprint: String,
+    pair_host: Option<String>,
 
-    /// Send a canned sequence of mouse/keyboard events after connecting — a smoke test for
-    /// SendInput injection independent of local input devices/permissions.
+    /// PIN to pair with, as entered into the host's Sunshine web UI. Required with --pair-host.
     #[arg(long)]
-    test_input: bool,
+    pair_pin: Option<String>,
 
-    /// Capture real local keyboard/mouse and forward it to the host, via a dedicated
-    /// transparent Wayland input surface (see input_surface.rs) — real absolute cursor
-    /// position, and naturally focus-scoped (only captures while that surface has focus).
+    /// Capture real local keyboard/mouse and forward it to the host, via a dedicated Wayland
+    /// input surface (see input_surface.rs) — real absolute cursor position, and naturally
+    /// focus-scoped (only captures while that surface has focus).
     #[arg(long)]
     capture_input: bool,
 
@@ -37,205 +40,104 @@ struct Args {
     /// choice if unset. Phase 1 MVP targets a single monitor.
     #[arg(long)]
     output: Option<String>,
+
+    /// Requested stream resolution/framerate/bitrate. Defaults match Phase 1's single-monitor
+    /// MVP target; Phase 2 will need to probe real client topology instead of hardcoding this.
+    #[arg(long, default_value_t = 1920)]
+    width: i32,
+    #[arg(long, default_value_t = 1080)]
+    height: i32,
+    #[arg(long, default_value_t = 60)]
+    fps: i32,
+    #[arg(long, default_value_t = 20000)]
+    bitrate_kbps: i32,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Must happen before *any* GStreamer gst::init() call, from any subsystem — GStreamer scans
+    // its plugin registry on the first gst::init() and caches it, so setting this later (e.g.
+    // inside decode.rs's VideoDecoder::new(), where it lived originally) only works if video
+    // happens to initialize GStreamer before audio does. It doesn't: LiStartConnection's internal
+    // stage order runs audio setup (audio.rs's AudioPlayer::new(), added for Phase 3) before
+    // input_surface.rs gets around to creating the VideoDecoder, so audio was winning the race
+    // and video's vah264dec silently never saw libva-nvidia-driver on the `va` plugin's vendor
+    // allow-list (see PLAN.md's Phase 1 VAAPI findings) — confirmed the hard way: "Error: creating
+    // video decoder" on the first real test after adding audio.
+    std::env::set_var("GST_VA_ALL_DRIVERS", "1");
+
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    let client_config = rdnet::build_client_endpoint_config(args.fingerprint)?;
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
+    if let Some(pair_host) = &args.pair_host {
+        let pin = args.pair_pin.as_deref().ok_or_else(|| anyhow!("--pair-pin is required with --pair-host"))?;
+        let identity = pairing::ClientIdentity::load_or_generate()?;
+        pairing::pair(&identity, pair_host, args.port, pin).await?;
+        return Ok(());
+    }
 
-    info!(host = %args.host, "connecting");
-    let connection = endpoint
-        .connect(args.host, "cwtrow")?
+    let host = args.host.ok_or_else(|| anyhow!("--host is required (unless using --pair-host)"))?;
+    let identity = pairing::ClientIdentity::load_or_generate()?;
+
+    let app = gamestream::pick_app(&identity, &host, args.port).await.context("selecting an app to launch")?;
+
+    let mut ri_key = [0u8; 16];
+    let mut ri_key_iv = [0u8; 16];
+    openssl::rand::rand_bytes(&mut ri_key)?;
+    openssl::rand::rand_bytes(&mut ri_key_iv)?;
+    // GameStream derives the input-encryption key ID from the first 4 bytes of the IV,
+    // big-endian — matches moonlight-qt's convention (see gamestream.rs's launch() doc comment).
+    let ri_key_id = i32::from_be_bytes(ri_key_iv[..4].try_into().unwrap());
+
+    let session = gamestream::launch(&identity, &host, args.port, &app, args.width, args.height, args.fps, &ri_key, ri_key_id)
         .await
-        .context("QUIC handshake with host failed")?;
-    info!("connected");
+        .context("launching stream session")?;
 
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .context("opening control stream")?;
-
-    send_control(&mut send, &ControlMessage::ClientHello {
-        protocol_version: rdproto::PROTOCOL_VERSION,
-    })
-    .await?;
-
-    match recv_control(&mut recv).await? {
-        ControlMessage::ServerHello {
-            accepted: true,
-            protocol_version,
-        } => {
-            info!(protocol_version, "host accepted connection");
-        }
-        ControlMessage::ServerHello {
-            accepted: false, ..
-        } => return Err(anyhow!("host rejected connection (protocol version mismatch)")),
-        other => return Err(anyhow!("unexpected message during handshake: {other:?}")),
-    }
-
-    // Phase 1 MVP: single hardcoded monitor topology. Real topology probing (xrandr /
-    // wlr-output-management) lands alongside multi-monitor support in Phase 2.
-    let topology = ControlMessage::Topology(rdproto::Topology {
-        monitors: vec![rdproto::MonitorInfo {
-            id: 0,
-            width: 1920,
-            height: 1080,
-            refresh_rate_mhz: 60_000,
-            pos_x: 0,
-            pos_y: 0,
-        }],
-    });
-    send_control(&mut send, &topology).await?;
-    match recv_control(&mut recv).await? {
-        ControlMessage::TopologyAck => info!("topology acknowledged by host"),
-        other => warn!(?other, "expected TopologyAck"),
-    }
-
-    let output = args.output.clone();
-    let video_task = tokio::spawn(receive_video(connection.clone(), output));
-
-    if args.test_input {
-        send_test_input(&mut send).await?;
-    }
+    // Bounded, not unbounded — see decode.rs's VideoDecoder::new doc comment for why an
+    // unbounded queue anywhere in this pipeline is a real system-OOM risk under load. These are
+    // compressed decode units (much smaller than the raw frames further downstream), so a modest
+    // bound rather than 1 — no need to be as aggressive about forcing backpressure here.
+    let (encoded_tx, encoded_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(32);
+    stream::start(
+        &session,
+        &host,
+        &stream::StreamParams {
+            width: args.width,
+            height: args.height,
+            fps: args.fps,
+            bitrate_kbps: args.bitrate_kbps,
+        },
+        &ri_key,
+        &ri_key_iv,
+        encoded_tx,
+    )?;
 
     if args.capture_input {
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
-        let surface_output = args.output.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = input_surface::run(input_tx, surface_output, 1920, 1080) {
-                tracing::error!(error = ?e, "input surface exited");
-            }
-        });
-        info!("input capture started (Wayland surface, focus-scoped)");
-        tokio::spawn(async move {
-            while let Some(event) = input_rx.recv().await {
-                if let Err(e) = send_control(&mut send, &ControlMessage::Input(event)).await {
-                    warn!(error = %e, "failed to forward input event, stopping capture");
-                    break;
-                }
-            }
-        });
+        info!("input capture enabled (focus-scoped)");
     }
 
-    video_task.await??;
-    Ok(())
-}
-
-/// Temporary smoke test for SendInput injection (see `Args::test_input`): moves the mouse in
-/// a small square, clicks, then types "hi".
-async fn send_test_input(send: &mut quinn::SendStream) -> Result<()> {
-    use rdproto::{InputEvent, MouseButton};
-    use tokio::time::{sleep, Duration};
-
-    info!("sending test input sequence");
-    let moves = [(200, 200), (400, 200), (400, 400), (200, 400), (200, 200)];
-    for (x, y) in moves {
-        send_control(send, &ControlMessage::Input(InputEvent::MouseMove { x, y })).await?;
-        sleep(Duration::from_millis(300)).await;
-    }
-    send_control(
-        send,
-        &ControlMessage::Input(InputEvent::MouseButton {
-            button: MouseButton::Left,
-            pressed: true,
-        }),
-    )
-    .await?;
-    sleep(Duration::from_millis(100)).await;
-    send_control(
-        send,
-        &ControlMessage::Input(InputEvent::MouseButton {
-            button: MouseButton::Left,
-            pressed: false,
-        }),
-    )
-    .await?;
-
-    // US QWERTY scancodes for 'h' (0x23) and 'i' (0x17).
-    for scancode in [0x23u16, 0x17] {
-        send_control(send, &ControlMessage::Input(InputEvent::Key { scancode, pressed: true })).await?;
-        sleep(Duration::from_millis(60)).await;
-        send_control(send, &ControlMessage::Input(InputEvent::Key { scancode, pressed: false })).await?;
-        sleep(Duration::from_millis(150)).await;
-    }
-    info!("test input sequence sent");
-    Ok(())
-}
-
-async fn receive_video(connection: quinn::Connection, output: Option<String>) -> Result<()> {
-    // GStreamer's push_buffer() is a blocking C call — if it ever blocks (backpressure, a
-    // stalled Wayland round-trip), calling it directly in this async task would stall network
-    // reads too, since nothing else would ever reach the next `.await`. Hand frames off to a
-    // dedicated thread instead, so this task only ever does network I/O.
-    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let decoder_thread = std::thread::spawn(move || -> Result<()> {
-        info!("decoder thread: creating pipeline");
-        let decoder = decode::VideoDecoder::new(output.as_deref())?;
-        info!("decoder thread: pipeline ready, waiting for frames");
-        let mut pushed: u64 = 0;
-        while let Ok(frame) = frame_rx.recv() {
-            decoder.push_frame(&frame)?;
-            pushed += 1;
-            if pushed % 60 == 0 {
-                info!(pushed, "decoder thread: push_frame progress");
-            }
+    // Without this, killing the process (Ctrl+C, `kill`/`pkill`'s default SIGTERM, or anything
+    // short of a clean return from input_surface::run below) leaves the host's app session
+    // marked active — confirmed the hard way, repeatedly, in testing: an interrupted run leaves
+    // Sunshine rejecting the next /launch with "an app is already running" until either
+    // gamestream.rs's /resume fallback works (not reliable yet — see its doc comment) or the
+    // Sunshine service gets restarted by hand. LiStopConnection() tells the host the session
+    // ended on purpose. Catching only SIGINT (ctrl_c) wasn't enough — SIGTERM is `pkill`'s
+    // default signal and was hitting this exact bug during iteration.
+    tokio::spawn(async {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
         }
-        info!("decoder thread: channel closed, exiting");
-        Ok(())
+        info!("shutting down");
+        unsafe { moonlight_sys::LiStopConnection() };
+        std::process::exit(0);
     });
 
-    let mut reassembler = decode::FrameReassembler::new();
-    let mut frames_decoded: u64 = 0;
-
-    let result = (async {
-        info!("video task: entering datagram read loop");
-        loop {
-            let datagram = connection.read_datagram().await?;
-            let (header, header_len) = rdproto::decode_video_header(&datagram)?;
-            let payload = &datagram[header_len..];
-
-            if let Some(frame) = reassembler.push(&header, payload) {
-                frame_tx
-                    .send(frame)
-                    .map_err(|_| anyhow!("decoder thread exited"))?;
-                frames_decoded += 1;
-                if frames_decoded % 60 == 0 {
-                    info!(frame_id = header.frame_id, frames_decoded, "decoded frame pushed");
-                }
-            }
-        }
-    })
-    .await;
-
-    drop(frame_tx);
-    match decoder_thread.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(error = ?e, "decoder thread exited with error"),
-        Err(_) => tracing::warn!("decoder thread panicked"),
-    }
-    result
-}
-
-async fn send_control(send: &mut quinn::SendStream, msg: &ControlMessage) -> Result<()> {
-    let framed = rdproto::encode_control_message(msg)?;
-    send.write_all(&framed).await?;
-    Ok(())
-}
-
-async fn recv_control(recv: &mut quinn::RecvStream) -> Result<ControlMessage> {
-    let mut len_bytes = [0u8; 4];
-    recv.read_exact(&mut len_bytes)
-        .await
-        .context("reading control message length")?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    let mut body = vec![0u8; len];
-    recv.read_exact(&mut body)
-        .await
-        .context("reading control message body")?;
-    rdproto::decode_control_message(&body)
+    // input_surface.rs owns the one client-visible window: presents decoded video and, if
+    // capture_input is set, captures real keyboard/mouse input. Runs on this thread — it blocks
+    // for the life of the stream.
+    input_surface::run(encoded_rx, args.output, args.capture_input)
 }

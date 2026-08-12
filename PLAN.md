@@ -332,6 +332,257 @@ Hit and fixed three more real bugs before getting a picture on screen, in order:
 End-to-end confirmed working: real screen content captured on cwtrow, encoded, streamed over QUIC,
 decoded via VAAPI, and displayed fullscreen on this client's DP-2 monitor.
 
+## Architecture pivot (2026-08-12): Sunshine (host) + Moonlight protocol (client), custom shell
+
+Phase 1's custom QUIC-based AV+input pipeline (capture/encode on `host/`, decode/present/input on
+`client/`) got to a working end-to-end state on real hardware (see Phase 1 findings above), but hit
+a wall that isn't fixable in our own code: `client/src/input_surface.rs`'s merged video+input
+surface triggers a reproducible Mutter/GNOME Shell 50.3 compositor assertion failure
+(`meta_window_set_stack_position_no_sync: assertion 'window->stack_position >= 0' failed`) whenever
+`xdg_toplevel::set_fullscreen()` is called — confirmed via `journalctl`, confirmed not
+output-specific (`set_fullscreen(None)` still fails) and not commit-timing-specific (deferring the
+call past the first `configure`/`ack_configure` cycle still fails). This is a genuine compositor bug,
+not a defect in our Wayland usage.
+
+Decision: **stop building our own AV+input transport/capture/encode/decode stack.** Use
+[Sunshine](https://github.com/LizardByte/Sunshine) on the host (cwtrow) for capture + encode +
+streaming, and the Moonlight/GameStream wire protocol for the client, while still building a
+**custom client application** ("shell") around it rather than using stock `moonlight-qt` — so we
+keep control of presentation (our own Wayland surface, once workable), input capture, and whatever
+future features (clipboard/file transfer) still make sense to layer on top.
+
+Why this is a reasonable pivot, not just giving up:
+- Sunshine independently arrived at the same host-side architecture this plan's Phase 0 already
+  chose on its own: Desktop Duplication API capture, a virtual-display-driver integration (in fact
+  the same [VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
+  this plan picked in Phase 0 has a documented Sunshine integration path already), and
+  runtime hardware-encoder auto-detection (NVENC/QuickSync/AMF/software). It's a mature, widely
+  deployed implementation of exactly the host-side design this project independently converged on —
+  offloading to it retires our DDA/Media-Foundation code (`host/src/capture.rs`, `host/src/encode.rs`)
+  entirely, including the encoder-activation quirks we had to work around by hand
+  (`host/src/encode.rs`'s fallthrough logic for QSV/AMD failures).
+- Moonlight-protocol clients (`moonlight-qt` in particular) have already solved fullscreen
+  presentation on GNOME/Mutter — the exact class of problem that stopped us. We don't need to
+  reverse-engineer their fix; we get it by riding the same protocol/client lineage.
+
+### Client foundation decision: FFI bindings to `moonlight-common-c`, not a fork or a Rust wrapper crate
+
+Three options considered for the "custom shell":
+
+1. **Fork `moonlight-qt`** — mature C++/Qt/SDL2 client, already solves fullscreen/pairing/reconnect.
+   Rejected: full language switch, discards all already-validated Rust code
+   (`client/src/decode.rs`'s GStreamer VAAPI pipeline, `client/src/input_surface.rs`'s Wayland
+   surface management).
+2. **[`moonlight-common-rust`](https://github.com/MrCreativ3001/moonlight-common-rust)** — a
+   Sans-IO Rust reimplementation of the protocol. Rejected: v0.1.0, 0% documented, doesn't yet
+   support GameStream-style pairing — too immature to build on confidently.
+3. **Write our own Rust FFI bindings to [`moonlight-common-c`](https://github.com/moonlight-stream/moonlight-common-c)**
+   (the actual reference C library moonlight-qt itself uses) — **chosen**. Its public API
+   (`src/Limelight.h`) is a clean, deliberately FFI-friendly C API: `LiStartConnection` takes
+   `DECODER_RENDERER_CALLBACKS`/`AUDIO_RENDERER_CALLBACKS`/`CONNECTION_LISTENER_CALLBACKS` structs;
+   video arrives via a `submitDecodeUnit` callback carrying **raw Annex-B H.264/HEVC NAL data** —
+   byte-for-byte the same format our existing `client/src/decode.rs` GStreamer pipeline
+   (`h264parse` with `stream-format=byte-stream, alignment=au`) already consumes unchanged. Input is
+   simple synchronous calls (`LiSendMouseMoveEvent`, `LiSendKeyboardEvent`, ...) that our existing
+   `wl_pointer`/`wl_keyboard` handlers in `input_surface.rs` can call directly in place of our own
+   QUIC control-stream sends. This keeps almost all of our already-debugged decode/presentation code
+   and only replaces the transport/protocol layer. Tradeoff: `moonlight-common-c` doesn't implement
+   the GameStream/Sunshine PIN-pairing HTTPS handshake itself (that's application-level in every
+   client) — we implement that small piece ourselves — and we take on vendoring the C library plus
+   its patched ENet fork ([cgutman/enet](https://github.com/cgutman/enet)) and building them via the
+   `cc` crate.
+
+### What gets retired vs kept
+
+- **Retired**: `host/` entirely (Sunshine replaces DDA capture, MF encode, and `SendInput`
+  injection), `proto/` and `netcommon/`'s QUIC/datagram video-and-input protocol (Sunshine/Moonlight
+  has its own wire protocol — ENet control channel + RTP video/audio). `proto`/`netcommon` may still
+  be revived later for Phase 4 clipboard/file-transfer if that ends up not fitting into the
+  Moonlight protocol's channels — decide when Phase 4 is reached, not now.
+- **Kept**: `client/src/decode.rs` (GStreamer VAAPI decode pipeline, unchanged — just fed from a
+  different source), `client/src/input_surface.rs` (Wayland surface/presentation/input-capture,
+  input send call sites swapped from our control-stream to `Li*` FFI calls), all the hard-won
+  operational knowledge in the Phase 1 findings above (session-0/console-session constraints, VAAPI
+  dma-buf export gap, release-build performance, etc.) — still true regardless of transport.
+
+### Implementation status (2026-08-12): pivot complete and validated end-to-end on real hardware
+
+All of the following is done and confirmed working against the real cwtrow/Sunshine setup, not
+just compiled:
+
+- **Sunshine installed on cwtrow** — silent MSI install via SSH (`msiexec /quiet`), runs as a
+  Windows service. One real gotcha: its web UI has CSRF protection that rejects any origin other
+  than `localhost` by default — accessing it via the LAN IP (`https://192.168.1.55:47990`) needs
+  `csrf_allowed_origins = https://192.168.1.55:47990` added to `sunshine.conf`, then a service
+  restart.
+- **`client/moonlight-sys/`** — vendors `moonlight-common-c` + its `enet` fork + `nanors` (Reed-
+  Solomon FEC) flat under `vendor/` (not a live git submodule, matching this repo's existing
+  non-submodule structure). `build.rs` compiles the C sources via the `cc` crate and generates
+  bindings for `Limelight.h` via the `bindgen` crate. One environment-specific snag: this
+  machine's libclang has no unversioned resource-dir symlink, so bindgen couldn't find its own
+  freestanding headers (`stdbool.h` etc.) until `build.rs` explicitly passes
+  `-resource-dir=/usr/lib/clang/<version>`.
+- **`client/src/pairing.rs`** — the GameStream PIN-pairing handshake (not implemented by
+  `moonlight-common-c` itself). **Confirmed working against real Sunshine**: full RSA/AES
+  challenge-response completed correctly on the first real attempt, verified via Sunshine's own
+  `sunshine_state.json` showing our client cert stored under `named_devices`. One protocol
+  behavior worth remembering: Sunshine's server *holds the first HTTP request open* (long-polls)
+  until a human submits the matching PIN via its web UI — there's no server-side timeout, so the
+  client must not set a request timeout on that call either.
+- **`client/src/gamestream.rs`** — post-pairing HTTP session setup (`/applist`, `/launch`,
+  `/resume`, ported from moonlight-qt's `nvhttp.cpp`). Picks Sunshine's built-in "Desktop" app
+  automatically. **Real gotcha hit and fixed**: killing the client without calling
+  `LiStopConnection()` (e.g. `SIGTERM` from `pkill`, which the process wasn't catching) leaves
+  Sunshine's session marked active, and the next `/launch` fails with "an app is already running
+  on this host" — `gamestream.rs` now retries via `/resume` on that specific error, and
+  `main.rs` now catches `SIGTERM` in addition to `SIGINT`/Ctrl+C so this shouldn't recur in normal
+  use. (`/resume`'s exact query-parameter contract is still not 100% nailed down — it worked via a
+  Sunshine service restart clearing state in practice, but the `/resume` fallback path itself
+  errored once with a connection reset; revisit if "already running" recurs.)
+- **`client/src/stream.rs`** — the FFI glue: builds `SERVER_INFORMATION`/`STREAM_CONFIGURATION`,
+  wires `DECODER_RENDERER_CALLBACKS.submitDecodeUnit` to reassemble `DECODE_UNIT`'s `LENTRY`
+  buffer chain into contiguous Annex-B bytes and forward them into the *same* channel
+  `input_surface.rs` already read from pre-pivot — so `decode.rs` needed zero changes. Also wires
+  `CONNECTION_LISTENER_CALLBACKS` (stage/termination/connection-quality logging; `logMessage` is
+  C-variadic and can't be implemented from stable Rust, so that one specific log source is lost).
+  Audio callbacks are left null (Phase 3, not started).
+- **`client/src/input_capture.rs`** — replaced the old evdev→PS/2-scancode table (for our retired
+  `SendInput`-based host) with an evdev→Win32-VK-code table, since `LiSendKeyboardEvent2` expects
+  VK codes, not scancodes.
+- **`client/src/input_surface.rs`** — `wl_pointer`/`wl_keyboard` handlers now call
+  `LiSendMousePositionEvent`/`LiSendMouseButtonEvent`/`LiSendHighRes(H)ScrollEvent`/
+  `LiSendKeyboardEvent2` directly instead of forwarding over a channel to a QUIC sender — no more
+  manual remote-resolution scaling needed either, since `LiSendMousePositionEvent` takes a
+  reference-plane size and the host/library handle scaling.
+
+**End-to-end real-hardware confirmation**: pairing succeeds, session launch succeeds, Sunshine
+activates real **AMD hardware encoding** (`h264_amf` via AMF/D3D11) — something our own
+Media-Foundation-driving code in the now-retired `host/src/encode.rs` structurally could not do
+(its AMD path is async-only; our code only drove synchronous MFTs). `LiStartConnection` completes
+all 12 stages, real decoded frames flow through the unchanged `decode.rs` VAAPI pipeline at the
+correct resolution/format, and the window is visible and shows real video with real focus-scoped
+input capture working.
+
+**Old Mutter fullscreen-assertion finding, revisited**: re-enabling `toplevel.set_fullscreen()`
+(previously disabled as a diagnostic — see the now-superseded finding above) turned out to be the
+actual fix for the window-never-visible problem. The `meta_window_set_stack_position_no_sync`
+assertion still appears in `journalctl` when it's called, but GLib assertions of this form log a
+critical warning and continue rather than aborting — it was never actually the cause of the
+invisible window, and skipping fullscreen entirely (the prior workaround) turned out to be the
+actual bug, not the fix. Lesson: don't assume a logged "assertion failed" means the code path
+crashed; check whether the assertion macro is fatal before working around it.
+
+**Remaining known issue — composited-presentation stutter under compositor load** (tracked, not
+yet fixed): video freezes for multi-second stretches specifically when something compositor-heavy
+is also happening (video playback, window minimize/maximize animations) but stays smooth for
+cheap operations (dragging a window). Diagnosed via three independent signals ruling out
+network/host causes: `moonlight-common-c`'s own `connectionStatusUpdate` callback never once
+fired (`CONN_STATUS_POOR` never seen) during a reproduced freeze; GStreamer's `appsink` kept
+decoding at a steady ~50-60fps throughout the freeze (checked via `decode.rs`'s periodic frame-
+count log); and the drops are logged precisely at `input_surface.rs`'s `present_frame` — the
+compositor isn't releasing `wl_shm` buffers fast enough, even after widening the buffer pool from
+2 to 4 slots (searching for *any* free slot, not strict round-robin) made no difference to the
+sustained-stall case. This points squarely at composited presentation itself being unable to keep
+up when Mutter's compositor thread is also busy with other GPU work — exactly the tradeoff flagged
+as a risk in the "Phase 1 findings — decode-to-scanout spike" section above (VAAPI dma-buf export
+is broken on this NVIDIA + `nvidia-vaapi-driver` combination, forcing a composited-copy fallback
+instead of true direct scanout). The real fix is still the same one identified back then: either
+the upstream `nvidia-vaapi-driver` export bug gets fixed, or a different scanout path gets found —
+not something fixable by further tuning the client's own copy/buffer-management code.
+
+## Stutter investigation, continued (2026-08-12): root-caused to wl_shm presentation, not decode/network/GPU
+
+Added real instrumentation rather than continuing to guess: per-`wl_buffer` commit-to-release
+latency tracking in `input_surface.rs` (a `BufferTiming` struct alongside each buffer slot,
+logging on `wl_buffer::Event::Release`), plus a `ConnListenerConnectionStatusUpdate` callback in
+`stream.rs` (previously unwired) to catch `CONN_STATUS_POOR` if the network were degrading, plus
+a parallel `nvidia-smi -l 1` GPU utilization log for correlation.
+
+**Real data from a reproduced stutter**: three severe stalls in one session — 170.5s, 19.9s, and
+a 4.7-6.5s cluster — each ending with multiple buffers releasing within *microseconds* of each
+other (not gradually), the signature of a surface that stopped being actively repainted at all for
+that stretch, then caught up in a burst. `connectionStatusUpdate` never once reported
+`CONN_STATUS_POOR` during any of this. GStreamer's `appsink` kept decoding at a steady ~50-60fps
+throughout (checked via `decode.rs`'s periodic frame-count log timestamps). GPU utilization stayed
+busy (67-81%) through the entire 170s stall — not idle. This rules out network, host encoder, and
+GPU/decode starvation as causes; the stall is specifically in `present_frame`'s wait for a free
+`wl_shm` buffer slot.
+
+Asked the user directly whether they were switching away from/minimizing the client window during
+the stalls (the obvious alternative explanation for "stopped being repainted") — confirmed no, the
+window stayed focused and visible throughout. Ruled out.
+
+**Exhaustively tested every combination of xdg_toplevel state-request timing** against real
+hardware: `set_fullscreen()` or `set_maximized()` requested *after* the first `configure` (the
+order this client uses) makes the window visible but reproducibly trips a Mutter-internal
+assertion (`meta_window_set_stack_position_no_sync: assertion 'window->stack_position >= 0'
+failed`, visible in `journalctl --user`); either state requested *before* the first commit
+(xdg-shell's documented/recommended pattern) leaves the window invisible; no state request at all
+also leaves it invisible; and a 300ms settle delay before the deferred request (in case it was a
+just-mapped-window race) made no difference — the assertion isn't timing-sensitive. Checked for
+`zwlr_layer_shell_v1` (would sidestep `xdg_toplevel`'s window-stack machinery entirely, where this
+assertion lives) via a registry dump — not advertised by this compositor, so not an available
+escape hatch.
+
+**Confirmed this is a genuine, external Mutter bug, not our code**: the identical assertion is a
+long-standing, cross-distro bug tracked upstream as
+[GNOME/mutter#1647](https://gitlab.gnome.org/GNOME/mutter/-/work_items/1647), reproducible with
+literally `mpv -fullscreen some-video.mp4` — i.e. triggered by *any* client requesting fullscreen
+shortly after mapping, unrelated to anything specific to this project.
+
+**But then isolated the actual severity to our specific rendering approach, not the assertion
+itself**: ran a controlled A/B test on this exact machine — `mpv --fullscreen --fs-screen-name=DP-2
+--vo=gpu` playing a synthetic 20-second 1080p60 test video. The assertion fired (confirmed via
+`journalctl`, same moment as our client's), but mpv finished playback in a clean ~21.3s
+wall-clock — **no stalls at all**. This decisively separates two things this investigation had
+been conflating: the Mutter assertion is real but apparently harmless on its own (mpv hits it and
+keeps playing fine); our client's severe stalls come from something specific to *our* presentation
+method, not the assertion. The concrete difference: mpv renders via GL/EGL (`eglSwapBuffers`),
+while this client renders via `wl_shm` buffers gated on `wl_buffer::Release` events — a
+fundamentally different Mutter code path for scheduling repaints. It's very plausible the same
+underlying `stack_position` corruption disrupts Mutter's SHM-repaint scheduling specifically,
+without affecting EGL swap-chain scheduling at all — SHM repaints and EGL buffer swaps are
+serviced by different parts of the compositor.
+
+**Next step (not yet implemented, sized as new work, not a small tweak)**: switch
+`input_surface.rs`'s presentation from `wl_shm` to EGL/GLES rendering on the *same* existing
+surface (so the single merged video+input surface — the whole reason `wl_shm` was chosen originally
+over separately re-adopting `waylandsink`, per the "two windows" bug this project already fixed
+once — stays intact): create an EGL context bound to our `wl_surface` via `wl_egl_window`, upload
+each decoded BGRx frame as a GL texture, draw a full-screen textured quad, `eglSwapBuffers` instead
+of `wl_shm`'s attach/damage/commit. Needs new dependencies (EGL/GLES bindings — `khronos-egl` or
+similar) and a real GLES2 shader/texture-upload path; a genuinely new subsystem, not a quick patch.
+
+**Implemented and confirmed fixed (2026-08-12)**: new `client/src/gl_present.rs` module —
+`khronos-egl` (static-linked) for EGL context/surface/display management, `wayland-egl` for the
+`wl_egl_window` native-window handle bound to the *same* `wl_surface` used for input (kept the
+merged coordinate space), `glow` for GLES2 calls. Renders each decoded BGRx frame as a GL texture
+onto a full-screen quad (fragment shader swaps R/B to avoid needing the
+`EXT_texture_format_BGRA8888` extension — `decode.rs`'s frames are uploaded as if `RGBA` and
+corrected in the shader) and presents via `eglSwapBuffers`. `wp_viewporter` is no longer needed at
+all — GL's own bilinear texture sampling handles scaling the frame's native decode resolution up
+to the output's physical size, so `input_surface.rs` dropped that dependency along with the entire
+`wl_shm` buffer-pool/timing machinery (`BufferSlot`, `BufferTiming`, `FrameBuffers`,
+`create_frame_buffers`, the `wl_buffer::Event::Release` `Dispatch` impl — all deleted). All API
+signatures were verified directly against the vendored crate sources (not assumed from memory)
+before writing the code, and it compiled and worked correctly on the first real test.
+
+**Real-hardware result**: consistent ~60fps swap cadence sustained through the same
+video-playback/window-animation stress conditions that previously produced 170-second stalls —
+zero drop/stall warnings logged (there's no longer a mechanism that *could* drop a frame the way
+`wl_shm`'s "no free buffer" path could). User-confirmed: "this looks much better." The Mutter
+`stack_position` assertion still fires once in `journalctl` (expected — it's an external bug in
+window-state transition handling, unrelated to the presentation backend), but no longer produces
+any observable effect, exactly as the mpv control test predicted.
+
+This closes out the stutter investigation. Phase 1 MVP (now on the Sunshine/Moonlight
+architecture) is functionally complete: pairing, session launch, hardware-encoded streaming,
+GLES-presented video, and focus-scoped real input capture all confirmed working end-to-end on real
+hardware.
+3. Implement the GameStream/Sunshine HTTPS PIN-pairing handshake.
+4. Wire `client/src/decode.rs` and `client/src/input_surface.rs` into the FFI callback structs,
+   replacing the QUIC-based `main.rs` transport.
+
 ## Suggested tech stack
 
 **Rust** for both sides is the recommendation: one language across host (Windows) and client (Linux), strong crates
@@ -347,20 +598,259 @@ C++ is the fallback if a specific Windows capture/IDD API turns out to need it a
   decode-to-scanout looks achievable on this client's Mutter version without a DRM lease. Two concrete carry-overs
   into Phase 1: install `libva-nvidia-driver` on the client (missing — VAAPI decode won't work without it), and
   spike the fullscreen-dmabuf-scanout path to confirm it in practice rather than just on paper.
-- **Phase 1 — Single-monitor MVP — streaming + input DONE (2026-08-11), benchmark pending**: host streams one
-  real display, client shows it fullscreen on one monitor (confirmed working end-to-end on real hardware — see
-  Phase 1 findings above), keyboard/mouse input works (real evdev capture on the client forwarding relative mouse
-  motion + key events to `SendInput` on the host; requires the client's running user to be in the Linux `input`
-  group for `/dev/input/event*` access, not exclusive-grabbed for now — input still reaches the local desktop too,
-  see `client/src/input_capture.rs`). Still open: benchmark latency against current `xfreerdp-aad` setup as the
-  go/no-go gate for continuing to Phase 2.
-- **Phase 2 — Multi-monitor**: extend to 3 synthetic host monitors matching client topology exactly, independent
-  per-monitor streams.
-- **Phase 3 — Audio**: WASAPI loopback → Opus → PipeWire playback.
-- **Phase 4 — Clipboard & file transfer**: bidirectional text/image/file sync.
+- **Phase 1 — Single-monitor MVP — DONE (2026-08-12, on the Sunshine/Moonlight architecture)**: the
+  description below is superseded by the architecture pivot (see that section above) — Sunshine
+  (host capture/encode) + a custom Rust client speaking GameStream/Moonlight via FFI bindings to
+  `moonlight-common-c` replaced the from-scratch QUIC protocol this paragraph originally described.
+  Confirmed working end-to-end on real hardware: pairing, session launch, real AMD hardware
+  encoding (via Sunshine, not our own since-retired Media Foundation code), GLES-presented video
+  (`client/src/gl_present.rs`, replacing an earlier `wl_shm` path — see the stutter investigation
+  above), and focus-scoped real Wayland input capture forwarding to `LiSend*` calls. Latency
+  benchmark against `xfreerdp-aad` still not run — no longer a hard go/no-go gate now that this
+  much has already shipped, but still worth doing at some point for a real before/after number.
+- **Phase 2 — Multi-monitor — DONE (2026-08-12)**: extended to the 3-monitor topology this plan
+  originally specified (portrait + ultrawide + 2560×1440), matching client output topology.
+  Confirmed working end-to-end: `rdhost.exe` configures all 3 virtual monitors at their correct
+  distinct resolutions, positions them to exactly match the client's real `xrandr` layout, and
+  launches all 3 Sunshine instances.
+
+  **Architecture**: GameStream (what Sunshine/Moonlight implement) is fundamentally
+  single-display-per-session — there's no "stream one combined desktop spanning multiple
+  monitors" mode. The approach: run **one Sunshine instance per monitor**, each bound to its own
+  virtual display via `output_name` and a distinct base `port` (Sunshine's `port` config offsets
+  its whole port family — web UI/HTTP/HTTPS/RTSP/etc — together as one unit, confirmed against
+  real instances). Since `moonlight-common-c` is a single-global-connection-per-process library,
+  the client runs as **3 separate `rdclient` processes**, one per monitor/port/output — each
+  naturally focus-scoped by Wayland already (input only routes to whichever process's surface
+  currently has pointer/keyboard focus), so no extra input-routing code needed. `client/src/
+  pairing.rs`/`gamestream.rs`/`stream.rs` already generalized to take a `--port` argument for
+  this (see `pairing::Ports::from_base`).
+
+  **`host/` crate role**: `host/` was fully rewritten (old QUIC-era capture/encode/input code
+  deleted) into a one-shot interactive setup tool (`host/src/{main,topology,vdd,mmt,sunshine}.rs`)
+  that the user runs via the KVM (not SSH — see below): configures the virtual monitors, positions
+  them via NirSoft's MultiMonitorTool, discovers each display's Sunshine `device_id` (parsed from
+  a JSON block Sunshine logs at startup — `"Currently available display devices:"` — not
+  documented anywhere, found by reading a real `sunshine.log`), and configures/launches the 3
+  Sunshine instances. Also supports `rdhost.exe --teardown` to remove the virtual monitors and
+  stop the extra Sunshine instances once a session's done, rather than leaving them sitting in
+  Display Settings indefinitely.
+
+  **Driver: switched from stock VDD to [MolotovCherry/virtual-display-rs](
+  https://github.com/MolotovCherry/virtual-display-rs) mid-Phase-2, after confirming a hard,
+  unfixed upstream bug in stock VirtualDrivers/Virtual-Display-Driver**: running 3 VDD virtual
+  monitors at 3 *different* resolutions is fundamentally broken there — the driver periodically
+  reasserts whatever resolution is listed *first* in `vdd_settings.xml`'s shared resolution list
+  across **all** its monitors (confirmed by reordering the list and watching the "reverts to"
+  target change to match), regardless of how aggressively the layout is reapplied. Matches
+  [VirtualDrivers/Virtual-Display-Driver#178](https://github.com/VirtualDrivers/Virtual-Display-Driver/issues/178),
+  no maintainer fix. (A from-source build of SudoMaker/SudoVDA — the driver Apollo's ecosystem
+  uses instead, for the same reason — was attempted first as a replacement, but the EWDK/WDK
+  driver-toolchain saga that required hit an unresolved MSBuild property-resolution bug specific
+  to that Insiders-preview EWDK build; abandoned in favor of virtual-display-rs, which needed no
+  from-source driver build at all.)
+
+  virtual-display-rs configures monitors live over a named-pipe IPC (via its
+  `virtual-display-driver-cli.exe`: `remove-all` + one `add <W>x<H>@<Hz> --name <label>` per
+  monitor) rather than a config file + device restart — no shared-resolution-list bug, confirmed
+  by holding 3 distinct resolutions indefinitely in testing. Two bugs of its own along the way,
+  both worked around: (1) the last **tagged release** (v0.3.1)'s IPC pipe denies every caller —
+  "Access is denied", even elevated Administrator from the interactive console — while the **dev
+  branch** build's pipe is deliberately open to anyone (its own source comment: "these security
+  attributes will allow anyone access, so local account does not need admin privileges to use
+  it"); fixed by installing the prebuilt dev-branch driver from
+  [issue #115](https://github.com/MolotovCherry/virtual-display-rs/issues/115) instead of the
+  tagged release. (2) explicit `--id N` on `add` unreliably reports "already exists" even
+  immediately after `remove-all`; worked around by leaving IDs auto-assigned and correlating
+  monitors to targets by resolution instead (see below) — not needed for `--name`, which works
+  fine and is what `mmt.rs`'s driver-detection filter (`"VirtuDisplay+"` in the monitor's PnP
+  friendly name) and `sunshine.rs`'s existing resolution-based `output_name` matching both key
+  off instead.
+
+  Fully **scriptable, no interactive session needed**, unlike stock VDD's install: certificate via
+  `certutil -addstore` (Root + TrustedPublisher — plain CLI, no UI to render), driver install via
+  the `nefconc` CLI's 3-command sequence (`--remove-device-node`, `--create-device-node`,
+  `--install-driver --inf-path`) instead of an MSI/GUI installer. (An attempt to switch to
+  **Apollo**, ClassicOldSong's Sunshine fork with virtual-display-rs's SudoVDA-lineage driver
+  bundled in, was tried first per a Reddit tip — its installer stalled/failed non-interactively
+  over SSH the same way stock VDD's did, so it was dropped in favor of driving virtual-display-rs
+  directly, which turned out to have the scriptable `nefconc` path this whole time.)
+
+  **Positioning (`mmt.rs`) needed real debugging even after the driver swap fixed resolution**:
+  - Real, hard-earned finding: `/SetMonitors` and `/EnableAtPosition` **must be issued as a single
+    combined `/SetMonitors` call**, not split across two separate MultiMonitorTool invocations
+    (one for the 3 virtual monitors, one for pushing the real monitor away). Splitting them
+    produced a completely different, 100%-deterministic scrambled layout for *every* monitor
+    (not just the one in the second call) — unaffected by call ordering, a `Primary=1` flag, or
+    added settle delays, which is the signature of `/SetMonitors` operating on the complete
+    monitor topology atomically rather than accepting incremental partial updates.
+  - The real monitor being pushed **far** away (a 5000px margin) rather than just below the
+    virtual monitors' bounding box was tried and also produced a different but still-broken
+    scrambled layout — consistent with Windows' display-config validation rejecting/re-flowing a
+    topology where a monitor is a fully disconnected "island" touching no other monitor's edge.
+    Fixed by pushing it exactly flush against the bounding box's bottom edge (margin = 0) instead.
+  - The target sitting at `(0,0)` needs `Primary=1` explicitly — otherwise the *real* monitor
+    (Primary from before any of this ran) stays Primary even after being relocated, and Windows
+    renormalizes the whole coordinate space around it, silently shifting every other monitor.
+  - Correlating a `\\.\DISPLAYn` name to a `TargetMonitor` **by raw MultiMonitorTool CSV
+    enumeration order doesn't reliably match whatever order Windows itself used when applying
+    `/SetMonitors`** — this silently swapped two same-shaped-topology targets' positions with
+    each other in testing. Fixed by matching monitors to targets **by resolution** instead
+    (`(width, height)`, derived from the CSV's `Left-Top`/`Right-Bottom` columns rather than
+    parsing the `Resolution` column's string format) — both for the initial assignment *and* for
+    a post-`apply()` verification re-list, since a `\\.\DISPLAYn` name isn't guaranteed to still
+    refer to the same monitor after `apply()` either. Every target's resolution is guaranteed
+    distinct by `topology.rs`, the same property `sunshine::find_device_id` already relies on.
+  - `sunshine::discover_displays()` was hardened alongside all this: a single fixed 3s wait after
+    `Restart-Service SunshineService` sometimes lost the race against Sunshine's own startup
+    display-enumeration pass (stale or entirely-missing log marker); replaced with polling for a
+    marker newer than the restart, up to 20s. A 3s settle delay was also added between finishing
+    `mmt::apply()` and restarting Sunshine, since Sunshine's re-enumeration was sometimes fast
+    enough to still see a monitor's pre-resize mode.
+
+  **Also confirmed along the way (holds regardless of driver)**: this whole tool must run from an
+  actual interactive session (KVM/console), not SSH — MultiMonitorTool's monitor enumeration
+  silently returns empty results from an SSH-spawned Session 0 process, even with another
+  interactive session active elsewhere on the machine (a stricter version of the same class of
+  problem as DDA capture's session requirement from Phase 1; virtual-display-rs's own CLI doesn't
+  have this restriction, only MultiMonitorTool does). `PowerShell Start-Process -ArgumentList`
+  with a string array does *not* auto-quote elements containing spaces (a real, repeatedly-hit bug
+  this session — always build a single pre-quoted argument string instead, or use a `.ps1` script
+  file with a proper `$args` array passed to the native exe directly).
+
+  **`launch_instance` needed real hardening too, all confirmed by the extra Sunshine instances
+  going dark shortly after launch, one bug at a time**:
+  - Spawned without any special process-creation flags, an extra instance stayed attached to
+    `rdhost.exe`'s own console — closing that console window (the normal end of an interactive
+    "Run as administrator" session) sent it a CTRL_CLOSE_EVENT and killed it. `DETACHED_PROCESS`
+    was tried first and made it *worse*: the instance now survived console closure but immediately
+    crashed with `ERROR_ACCESS_DENIED` querying display paths (`DETACHED_PROCESS` evidently strips
+    window-station/desktop access too, which Sunshine's DirectX/DXGI display enumeration needs, not
+    just the console). `CREATE_NO_WINDOW` gets "survives console closure" without that side effect.
+  - With `CREATE_NO_WINDOW`, there's no console for Sunshine's own stdout/stderr to land on at
+    all — a start-up crash was completely invisible until stdout/stderr were explicitly redirected
+    to per-instance log files.
+  - Running with `current_dir` set to the *instance's own* directory (to keep its config
+    self-contained) broke Sunshine's shader compilation entirely (`Couldn't compile
+    assets/shaders/directx/... [0x80070003]` → `Platform failed to initialize`) — Sunshine resolves
+    its assets via paths relative to cwd, not relative to its own exe location. Fixed by running
+    with cwd at Sunshine's *install* directory instead, and redirecting only `file_state`/
+    `credentials_file`/`log_path` to the instance's own directory via conf keys (matching Sunshine's
+    own documented multi-instance pattern) so instances don't clobber each other's state.
+  - Sunshine's CSRF protection only auto-allows localhost-style origins by default; pairing against
+    a non-default instance's web UI from cwtrow's LAN IP (rather than `localhost`) was rejected
+    ("The request was blocked by CSRF protection") until `csrf_allowed_origins` was set explicitly
+    per instance.
+  - `rdhost.exe` didn't stop previous extra instances before launching new ones, so **re-running it
+    (e.g. to pick up a config fix) silently left old and new processes running side by side on the
+    same ports** — the *old* one, having gotten there first, kept answering requests with its stale
+    config, making every fix above look like it hadn't worked until this was caught. Fixed by
+    calling `sunshine::stop_extra_instances()` at the start of every run, not just `--teardown`.
+
+  **Client-side: a single-command launcher (`client/src/bin/rdconnect.rs`)** replaces manually
+  running 3 `rdclient` invocations with hand-typed `--port`/`--width`/`--height`/`--output` per
+  monitor. `client/` was restructured into a `lib.rs` + multiple binaries (`rdclient`, `rdconnect`)
+  so the launcher can reuse `pairing`/`gamestream` without duplicating the pairing handshake.
+  `rdconnect <host>` detects this machine's connected outputs via `xrandr --query`
+  (`client/src/topology.rs`, mirroring `host/src/topology.rs`'s target list by hand — no shared
+  crate between the two separate Cargo projects), matches them to targets by resolution, checks
+  each instance's pair status via a new `pairing::pair_status()` (`/serverinfo`'s `PairStatus`
+  field, safe to call whether or not already paired), prompts for a PIN only for instances not yet
+  paired, then spawns one `rdclient` child per monitor with the right flags already filled in and
+  waits on all of them, forwarding Ctrl+C to each so `LiStopConnection()` runs cleanly instead of
+  leaving the host's app session stuck "already running" for the next connect.
+
+  **HEVC support added mid-testing, not originally planned for Phase 2**: the first real 3-monitor
+  test showed the portrait and standard monitors streaming fine but the ultrawide (5120px wide)
+  never producing a single frame, connection eventually timing out (`error_code=-100`, moonlight-
+  common-c's "no video traffic" code). Root cause, found in that instance's now-captured
+  `sunshine.log`: cwtrow's AMD AMF H.264 hardware encoder fails `encoder->Init()` outright above
+  some width ceiling well below 5120 — a real hardware/driver limitation, not fixable from either
+  side's software. Client previously only ever advertised `VIDEO_FORMAT_H264` in
+  `supportedVideoFormats`; changed to offer H264 *and* H265 (`stream.rs`), letting Sunshine fall
+  back to HEVC (whose encoder doesn't share that ceiling) for whichever stream needs it — in
+  practice Sunshine picked HEVC for all 3 once offered, not just the ultrawide. Client-side, this
+  needed real work too, not just flipping a flag: `decode.rs`'s pipeline was H.264-only
+  (`h264parse ! vah264dec`); added an HEVC branch (`h265parse` + a decoder chosen by codec), and
+  `stream.rs`/`input_surface.rs` needed a way to get the *negotiated* codec (known only once
+  `on_decoder_setup` fires, synchronously inside `LiStartConnection`) to the decoder-construction
+  call that happens just after. Also found this client's VA-API stack has no HEVC decode entry
+  point at all (`gst-inspect-1.0 vah265dec` finds nothing) despite having one for H.264 — used
+  `nvh265dec` (NVDEC, via the separate `nvcodec` GStreamer plugin) instead, which does exist here
+  and accepts the same byte-stream/`au` caps.
+
+  **A real, serious bug found only by running all 3 streams together long enough**: the Linux
+  desktop itself (running the client) crashed from memory exhaustion mid-test — GNOME's low-memory
+  monitor force-killed an application after the whole system's available memory ran out. Root
+  cause: every channel in the video/audio pipeline (`decode.rs`'s decoded-frame channel,
+  `stream.rs`'s encoded-decode-unit and audio-sample channels) was an unbounded `mpsc::channel()`.
+  The decoded-frame one is the dangerous one — full uncompressed BGRx frames, ~29MB each for the
+  ultrawide at 60fps — and if presentation ever falls even briefly behind decode (very plausible
+  with 3 windows competing for the same GPU/compositor), an unbounded channel queues them with no
+  limit, `GStreamer`'s own `appsink` `drop(true)`/`max_buffers(1)` config notwithstanding (that
+  only bounds GStreamer's *internal* backlog, not what the Rust code downstream of the callback
+  does with each frame it *does* get). Fixed by switching every channel in the pipeline to
+  `sync_channel` with a small bound (1 for raw video frames, 32 for the smaller compressed/audio
+  ones) — a full channel now applies real backpressure (blocks the producer) instead of growing
+  without limit.
+
+  **Also found while testing multi-window focus behavior**: a stuck-modifier-key bug — each of the
+  3 monitors is a fully independent process/window with its own local keyboard-modifier bitmask
+  (`input_surface.rs`'s `Inner.modifiers`), and a real key-up event only ever arrives at whichever
+  window happens to have Wayland keyboard focus *at release time*, not whichever had focus when
+  the key went down. Pressing a modifier in one window then switching focus elsewhere before
+  releasing it left that bit stuck set forever, corrupting every subsequent key event sent from
+  that window. Fixed by handling `wl_keyboard::Event::Leave` (previously ignored entirely): on
+  losing focus, synthesize a key-up for every modifier currently marked held — so the *host's* own
+  OS-level modifier state also clears, not just local tracking — then reset to 0.
+
+  **Known, accepted limitation, not planned for a fix within this architecture**: dragging a
+  window across the boundary between two of the 3 monitors doesn't work like real RDP — each
+  monitor is captured/encoded/streamed as a fully independent Sunshine session with no shared
+  frame timing, so a window crossing that boundary would visually cut from one stream to the other
+  rather than gliding continuously, even though the 3 virtual monitors form one continuous desktop
+  on the host side. Fixing this for real means the from-scratch single-combined-desktop capture +
+  custom protocol this project originally started as (see the architecture-pivot section below) —
+  **decided (2026-08-12) to revisit that path in a future session** rather than mid-way through
+  this one. Re-reading the Session 0 finding above: it was never a *dead end*, just deferred — the
+  standard fix (a Windows service using `WTSQueryUserToken` + `CreateProcessAsUser` to launch the
+  capture agent into the interactive console session, the same technique Sunshine/Parsec use
+  themselves) was already known and explicitly scoped to Phase 5 packaging, not abandoned as
+  infeasible. For live testing (not production packaging) it doesn't even need that — running the
+  old capture/encode host binary interactively, the same way `rdhost.exe` runs today, would be
+  enough to validate the approach. The old capture/encode/input code (`host/src/capture.rs`,
+  `encode.rs`, `input.rs`) was deleted during the Sunshine pivot but is recoverable from git
+  history (`4e55dd1` and earlier). Real scope if taken on: DDA capture + Media Foundation encode
+  for all 3 virtual monitors *simultaneously* (Phase 1 only ever validated one), a combined
+  multi-monitor wire protocol, and a client-side single window/compositor instead of 3 independent
+  processes — most of Phase 1-2's original scope, redone for multi-monitor, not a quick follow-up.
+- **Phase 3 — Audio — DONE (2026-08-12)**: `client/src/audio.rs`, a GStreamer pipeline
+  (`appsrc ! opusdec ! audioconvert ! audioresample ! autoaudiosink`) wired into
+  `AUDIO_RENDERER_CALLBACKS` in `stream.rs`. `moonlight-common-c`'s `AudioRendererDecodeAndPlaySample`
+  hands over raw Opus packets (despite the name, it does not decode them itself) — decoded and
+  played via the same GStreamer dependency already used for video, rather than adding a separate
+  libopus binding. Current scope only handles simple mono/stereo Opus
+  (`channel-mapping-family=0`, matching `stream.rs` negotiating `AUDIO_CONFIGURATION_STEREO`);
+  surround would need libopus's multistream channel-mapping table, not implemented. Confirmed
+  working end-to-end on real hardware, audio and video in sync. Hit and fixed one real bug along
+  the way: `GST_VA_ALL_DRIVERS` (needed by `decode.rs`'s `vah264dec`, see the Phase 1 VAAPI
+  findings) was being set inside `VideoDecoder::new()`, but GStreamer scans its plugin registry on
+  the *first* `gst::init()` call from any subsystem and caches it — `LiStartConnection`'s internal
+  stage order runs audio setup before `input_surface.rs` gets around to creating the video
+  decoder, so audio's `gst::init()` (with the env var still unset) was winning the race and
+  silently breaking VAAPI decode. Fixed by moving the `env::set_var` call to the very top of
+  `main()`, before anything GStreamer-related can run.
+- **Phase 4 — Clipboard & file transfer**: bidirectional text/image/file sync. Not started.
 - **Phase 5 — Hardening**: reconnect/resilience, adaptive bitrate, auth/security finalization, packaging
   (host as a Windows service/startup app, client as a normal desktop app), replace `xfreerdp-aad` wrapper usage
-  once at parity.
+  once at parity. Also planned (not started, noted 2026-08-12 during multi-monitor setup): an option to
+  **disable the host's real/physical monitor(s) while a remote session is connected** — cwtrow's real KVM-
+  connected display currently shows up as an extra, oddly-positioned 4th monitor alongside the 3 virtual ones
+  in Windows' display arrangement, which is harmless functionally (the 3 virtual monitors' *relative* layout
+  to each other is what actually matters for streaming) but cluttered. Disabling it outright would leave no
+  way to see the host locally via the KVM, so this needs to be reversible from the **client** side — a toggle
+  to re-enable the physical monitor(s) remotely, not just a host-side switch — before it's safe to actually
+  use.
 
 ## Repo layout (proposed)
 
