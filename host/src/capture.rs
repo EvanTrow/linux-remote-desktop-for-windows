@@ -212,6 +212,11 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+    /// Cursor position in desktop coordinates, if visible — DDA doesn't rasterize the cursor
+    /// into the captured image itself, so without this the remote pointer is invisible on the
+    /// client (confirmed as a real usability problem: input injection worked fine, but there
+    /// was no way to see where clicks would land).
+    pub cursor: Option<(i32, i32)>,
 }
 
 fn acquire_frame(
@@ -283,7 +288,13 @@ fn acquire_frame(
             }
             context.Unmap(&staging, 0);
 
-            Ok(CapturedFrame { width, height, data })
+            let cursor = frame_info
+                .PointerPosition
+                .Visible
+                .as_bool()
+                .then_some((frame_info.PointerPosition.Position.x, frame_info.PointerPosition.Position.y));
+
+            Ok(CapturedFrame { width, height, data, cursor })
         })();
 
         duplication.ReleaseFrame()?;

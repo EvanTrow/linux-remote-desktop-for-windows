@@ -59,10 +59,14 @@ pub struct StreamInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputEvent {
-    /// Relative motion delta (matches evdev's `REL_X`/`REL_Y` on the client and
-    /// `SendInput`'s relative `MOUSEEVENTF_MOVE` on the host) — resolution-independent, no
-    /// coordinate-space mapping needed between client and host displays.
-    MouseMove { dx: i32, dy: i32 },
+    /// Absolute position in the remote display's pixel coordinates (0..width, 0..height).
+    /// The client accumulates its own relative evdev deltas into a virtual cursor position
+    /// (Wayland doesn't expose true global pointer position to arbitrary clients) rather than
+    /// forwarding raw deltas — that avoided drift/mismatch between the cursor-position marker
+    /// drawn into the video and where clicks actually land, since both derive from the same
+    /// tracked position instead of each accumulating independently (the marker locally, the
+    /// real position via Windows' own separate pointer-acceleration curve on relative moves).
+    MouseMove { x: i32, y: i32 },
     MouseButton { button: MouseButton, pressed: bool },
     MouseWheel { delta_x: i32, delta_y: i32 },
     Key { scancode: u16, pressed: bool },

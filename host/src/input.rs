@@ -4,11 +4,12 @@ use anyhow::{Context, Result};
 use rdproto::{ControlMessage, InputEvent, MouseButton};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
-    MOUSE_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, MOUSE_EVENT_FLAGS,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
 pub async fn run(mut recv: quinn::RecvStream) -> Result<()> {
     loop {
@@ -25,7 +26,16 @@ pub async fn run(mut recv: quinn::RecvStream) -> Result<()> {
 
 fn inject(event: InputEvent) -> Result<()> {
     let input = match event {
-        InputEvent::MouseMove { dx, dy } => mouse_input(dx, dy, MOUSEEVENTF_MOVE, 0),
+        InputEvent::MouseMove { x, y } => {
+            // Phase 1 MVP: single monitor, client and host both assume 1920x1080 (matches
+            // this host's real capture resolution — confirmed via capture.rs's dynamic
+            // IDXGIOutput::GetDesc() query). Multi-monitor-aware mapping is Phase 2.
+            let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1);
+            let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1);
+            let norm_x = (x as i64 * 65535 / screen_w as i64) as i32;
+            let norm_y = (y as i64 * 65535 / screen_h as i64) as i32;
+            mouse_input(norm_x, norm_y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0)
+        }
         InputEvent::MouseButton { button, pressed } => {
             let flags = match (button, pressed) {
                 (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,

@@ -132,6 +132,7 @@ impl EncoderChoice {
         unsafe {
             transform.SetOutputType(0, &output_type, 0).context("SetOutputType")?;
             transform.SetInputType(0, &input_type, 0).context("SetInputType")?;
+            set_low_latency_properties(&transform);
             transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
                 .context("start of stream")?;
@@ -142,6 +143,41 @@ impl EncoderChoice {
             transform,
             frame_index: 0,
         })
+    }
+}
+
+/// Tunes the encoder for real-time streaming instead of its offline/quality-focused defaults
+/// — without this, the software H.264 Encoder MFT (this host's working fallback, since neither
+/// hardware encoder activates — see Phase 1 findings in PLAN.md) runs closer to 1-2 fps than
+/// anything usable. Best-effort: not every encoder (especially hardware ones) supports every
+/// property, so failures here are logged and skipped rather than treated as fatal.
+fn set_low_latency_properties(transform: &IMFTransform) {
+    use windows::Win32::Media::MediaFoundation::{
+        ICodecAPI, CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonQualityVsSpeed,
+        CODECAPI_AVEncCommonRealTime, CODECAPI_AVEncMPVDefaultBPictureCount,
+    };
+    use windows::core::{Interface, VARIANT};
+
+    let codec_api: ICodecAPI = match transform.cast() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = ?e, "encoder doesn't expose ICodecAPI, using default (likely slow) settings");
+            return;
+        }
+    };
+
+    let props: &[(&str, windows::core::GUID, VARIANT)] = &[
+        ("CommonRealTime", CODECAPI_AVEncCommonRealTime, true.into()),
+        ("CommonLowLatency", CODECAPI_AVEncCommonLowLatency, true.into()),
+        ("MPVDefaultBPictureCount", CODECAPI_AVEncMPVDefaultBPictureCount, 0i32.into()),
+        ("CommonQualityVsSpeed", CODECAPI_AVEncCommonQualityVsSpeed, 0i32.into()),
+    ];
+    for (name, guid, value) in props {
+        unsafe {
+            if let Err(e) = codec_api.SetValue(guid, value) {
+                tracing::warn!(property = name, error = ?e, "encoder rejected low-latency property");
+            }
+        }
     }
 }
 
@@ -158,13 +194,17 @@ fn make_media_type(subtype: GUID, width: u32, height: u32) -> Result<IMFMediaTyp
                 &windows::Win32::Media::MediaFoundation::MF_MT_AVG_BITRATE,
                 BITRATE_BPS,
             )?;
-            // Force a keyframe (+ SPS/PPS) at least every 2 seconds. Without this, the
-            // encoder only emits its first IDR at startup — any client connecting later (or
-            // any datagram loss) has no reference frame to decode against, which is exactly
-            // the "video pipeline runs, decoder just shows black" symptom this fixes.
+            // Force a keyframe (+ SPS/PPS) at least every ~0.5s. Without this, the encoder
+            // only emits its first IDR at startup — any client connecting later has no
+            // reference frame to decode against (root cause of an earlier "black screen" bug).
+            // Kept short specifically because video rides unreliable QUIC datagrams: losing
+            // even one fragment of a P-frame corrupts every frame that references it until
+            // the next keyframe arrives intact, visible as scrambled/torn video — a short
+            // interval bounds how long that lasts. Proper fix is a client-requested keyframe
+            // on decode error; this is the cheap mitigation for now.
             media_type.SetUINT32(
                 &windows::Win32::Media::MediaFoundation::MF_MT_MAX_KEYFRAME_SPACING,
-                FPS * 2,
+                FPS / 2,
             )?;
         }
         Ok(media_type)
@@ -314,11 +354,43 @@ fn bgra_to_nv12(frame: &crate::capture::CapturedFrame) -> Nv12Frame {
         }
     }
 
+    if let Some((cx, cy)) = frame.cursor {
+        draw_cursor_marker(&mut y_plane, &mut uv_plane, width, height, cx, cy);
+    }
+
     Nv12Frame {
         width,
         height,
         y_plane,
         uv_plane,
+    }
+}
+
+/// Draws a simple high-contrast crosshair at the cursor position directly into the NV12
+/// planes. Not the real cursor shape/hotspot (that needs `GetFramePointerShape`, a bitmap
+/// cache across frames since DDA only sends it when it changes, and hotspot-aware blending) —
+/// just enough to see where clicks will land, which was the actual reported problem.
+fn draw_cursor_marker(y_plane: &mut [u8], uv_plane: &mut [u8], width: u32, height: u32, cx: i32, cy: i32) {
+    const RADIUS: i32 = 6;
+    let (w, h) = (width as i32, height as i32);
+    for dy in -RADIUS..=RADIUS {
+        for dx in -RADIUS..=RADIUS {
+            // Crosshair, not a filled block: only draw near the two axes.
+            if dx.abs() > 1 && dy.abs() > 1 {
+                continue;
+            }
+            let (x, y) = (cx + dx, cy + dy);
+            if x < 0 || y < 0 || x >= w || y >= h {
+                continue;
+            }
+            let (x, y) = (x as usize, y as usize);
+            y_plane[y * width as usize + x] = 235; // bright white luma, limited range
+            let uv_index = (y / 2) * width as usize + (x - x % 2);
+            if let Some(slot) = uv_plane.get_mut(uv_index..uv_index + 2) {
+                slot[0] = 128; // neutral chroma -> white/gray marker regardless of content
+                slot[1] = 128;
+            }
+        }
     }
 }
 

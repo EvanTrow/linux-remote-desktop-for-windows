@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 mod decode;
 mod input_capture;
+mod input_surface;
 
 /// Linux client for the custom remote desktop protocol. Phase 1 MVP: single monitor,
 /// no clipboard/audio. Connects to the host agent over QUIC, negotiates topology, then
@@ -26,9 +27,9 @@ struct Args {
     #[arg(long)]
     test_input: bool,
 
-    /// Capture real local keyboard/mouse via evdev and forward it to the host. Not exclusive
-    /// (input still reaches the local desktop too — see input_capture.rs). Requires the
-    /// running user to be in the `input` group.
+    /// Capture real local keyboard/mouse and forward it to the host, via a dedicated
+    /// transparent Wayland input surface (see input_surface.rs) — real absolute cursor
+    /// position, and naturally focus-scoped (only captures while that surface has focus).
     #[arg(long)]
     capture_input: bool,
 
@@ -104,8 +105,13 @@ async fn main() -> Result<()> {
 
     if args.capture_input {
         let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
-        let count = input_capture::spawn_all(input_tx)?;
-        info!(devices = count, "input capture started");
+        let surface_output = args.output.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = input_surface::run(input_tx, surface_output, 1920, 1080) {
+                tracing::error!(error = ?e, "input surface exited");
+            }
+        });
+        info!("input capture started (Wayland surface, focus-scoped)");
         tokio::spawn(async move {
             while let Some(event) = input_rx.recv().await {
                 if let Err(e) = send_control(&mut send, &ControlMessage::Input(event)).await {
@@ -127,9 +133,9 @@ async fn send_test_input(send: &mut quinn::SendStream) -> Result<()> {
     use tokio::time::{sleep, Duration};
 
     info!("sending test input sequence");
-    let moves = [(200, 0), (0, 200), (-200, 0), (0, -200)];
-    for (dx, dy) in moves {
-        send_control(send, &ControlMessage::Input(InputEvent::MouseMove { dx, dy })).await?;
+    let moves = [(200, 200), (400, 200), (400, 400), (200, 400), (200, 200)];
+    for (x, y) in moves {
+        send_control(send, &ControlMessage::Input(InputEvent::MouseMove { x, y })).await?;
         sleep(Duration::from_millis(300)).await;
     }
     send_control(
@@ -162,23 +168,57 @@ async fn send_test_input(send: &mut quinn::SendStream) -> Result<()> {
 }
 
 async fn receive_video(connection: quinn::Connection, output: Option<String>) -> Result<()> {
-    let decoder = decode::VideoDecoder::new(output.as_deref())?;
+    // GStreamer's push_buffer() is a blocking C call — if it ever blocks (backpressure, a
+    // stalled Wayland round-trip), calling it directly in this async task would stall network
+    // reads too, since nothing else would ever reach the next `.await`. Hand frames off to a
+    // dedicated thread instead, so this task only ever does network I/O.
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let decoder_thread = std::thread::spawn(move || -> Result<()> {
+        info!("decoder thread: creating pipeline");
+        let decoder = decode::VideoDecoder::new(output.as_deref())?;
+        info!("decoder thread: pipeline ready, waiting for frames");
+        let mut pushed: u64 = 0;
+        while let Ok(frame) = frame_rx.recv() {
+            decoder.push_frame(&frame)?;
+            pushed += 1;
+            if pushed % 60 == 0 {
+                info!(pushed, "decoder thread: push_frame progress");
+            }
+        }
+        info!("decoder thread: channel closed, exiting");
+        Ok(())
+    });
+
     let mut reassembler = decode::FrameReassembler::new();
     let mut frames_decoded: u64 = 0;
 
-    loop {
-        let datagram = connection.read_datagram().await?;
-        let (header, header_len) = rdproto::decode_video_header(&datagram)?;
-        let payload = &datagram[header_len..];
+    let result = (async {
+        info!("video task: entering datagram read loop");
+        loop {
+            let datagram = connection.read_datagram().await?;
+            let (header, header_len) = rdproto::decode_video_header(&datagram)?;
+            let payload = &datagram[header_len..];
 
-        if let Some(frame) = reassembler.push(&header, payload) {
-            decoder.push_frame(&frame)?;
-            frames_decoded += 1;
-            if frames_decoded % 60 == 0 {
-                info!(frame_id = header.frame_id, frames_decoded, "decoded frame pushed");
+            if let Some(frame) = reassembler.push(&header, payload) {
+                frame_tx
+                    .send(frame)
+                    .map_err(|_| anyhow!("decoder thread exited"))?;
+                frames_decoded += 1;
+                if frames_decoded % 60 == 0 {
+                    info!(frame_id = header.frame_id, frames_decoded, "decoded frame pushed");
+                }
             }
         }
+    })
+    .await;
+
+    drop(frame_tx);
+    match decoder_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = ?e, "decoder thread exited with error"),
+        Err(_) => tracing::warn!("decoder thread panicked"),
     }
+    result
 }
 
 async fn send_control(send: &mut quinn::SendStream, msg: &ControlMessage) -> Result<()> {

@@ -1,106 +1,15 @@
-//! Captures local keyboard/mouse via raw evdev and translates to `rdproto::InputEvent`.
-//!
-//! Phase 1 MVP: listens on every device with relevant capabilities (not exclusive-grabbed —
-//! input still reaches the local desktop too. Exclusive capture, so input goes to the remote
-//! session only, is a UX/safety decision worth its own review, deferred rather than risking
-//! locking someone out of their own keyboard). Requires the running user to be in the `input`
-//! group (`/dev/input/event*` is `root:input 0660`).
+//! Linux evdev keycode -> Windows scancode translation, shared by input_surface.rs (the
+//! actual input capture path — a Wayland surface's wl_keyboard reports these same evdev
+//! keycodes directly per protocol, so this table applies unchanged).
 
-use anyhow::{Context, Result};
-use evdev::{Device, EventSummary, EventType, KeyCode, RelativeAxisCode};
-use rdproto::{InputEvent, MouseButton};
-use tokio::sync::mpsc::UnboundedSender;
-
-pub fn spawn_all(tx: UnboundedSender<InputEvent>) -> Result<usize> {
-    let mut spawned = 0;
-    for (path, device) in evdev::enumerate() {
-        let has_keys = device.supported_events().contains(EventType::KEY);
-        let has_rel = device.supported_events().contains(EventType::RELATIVE);
-        if !has_keys && !has_rel {
-            continue;
-        }
-        let name = device.name().unwrap_or("<unknown>").to_string();
-        tracing::info!(?path, name, "capturing input device");
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = read_device(device, tx) {
-                tracing::warn!(?path, error = ?e, "input device read loop exited");
-            }
-        });
-        spawned += 1;
-    }
-    if spawned == 0 {
-        tracing::warn!(
-            "no readable input devices found — is this user in the `input` group? (/dev/input/event* is root:input 0660)"
-        );
-    }
-    Ok(spawned)
-}
-
-fn read_device(mut device: Device, tx: UnboundedSender<InputEvent>) -> Result<()> {
-    let (mut pending_dx, mut pending_dy) = (0i32, 0i32);
-    loop {
-        for ev in device.fetch_events().context("fetch_events")? {
-            match ev.destructure() {
-                EventSummary::RelativeAxis(_, code, value) => match code {
-                    RelativeAxisCode::REL_X => pending_dx += value,
-                    RelativeAxisCode::REL_Y => pending_dy += value,
-                    RelativeAxisCode::REL_WHEEL => {
-                        let _ = tx.send(InputEvent::MouseWheel {
-                            delta_x: 0,
-                            delta_y: value * 120, // WHEEL_DELTA
-                        });
-                    }
-                    RelativeAxisCode::REL_HWHEEL => {
-                        let _ = tx.send(InputEvent::MouseWheel {
-                            delta_x: value * 120,
-                            delta_y: 0,
-                        });
-                    }
-                    _ => {}
-                },
-                EventSummary::Synchronization(..) => {
-                    if pending_dx != 0 || pending_dy != 0 {
-                        let _ = tx.send(InputEvent::MouseMove {
-                            dx: pending_dx,
-                            dy: pending_dy,
-                        });
-                        pending_dx = 0;
-                        pending_dy = 0;
-                    }
-                }
-                EventSummary::Key(_, code, value) => {
-                    let pressed = value != 0; // 1 = down, 0 = up, 2 = autorepeat
-                    if value == 2 {
-                        continue; // let the host's own autorepeat handle held keys
-                    }
-                    if let Some(button) = mouse_button(code) {
-                        let _ = tx.send(InputEvent::MouseButton { button, pressed });
-                    } else if let Some(scancode) = windows_scancode(code) {
-                        let _ = tx.send(InputEvent::Key { scancode, pressed });
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-fn mouse_button(key: KeyCode) -> Option<MouseButton> {
-    match key {
-        KeyCode::BTN_LEFT => Some(MouseButton::Left),
-        KeyCode::BTN_RIGHT => Some(MouseButton::Right),
-        KeyCode::BTN_MIDDLE => Some(MouseButton::Middle),
-        _ => None,
-    }
-}
+use evdev::KeyCode;
 
 /// Linux evdev `KEY_*` -> Windows PS/2 Set 1 scan code, for `SendInput(KEYEVENTF_SCANCODE)`.
 /// Extended keys (arrows, ins/del/home/end/pgup/pgdn, right ctrl/alt, win keys) are encoded as
 /// `0xE000 | base_code` — the host checks that high byte to add `KEYEVENTF_EXTENDEDKEY`.
 /// Covers standard US QWERTY; not exhaustive (no multimedia/international keys) — good enough
 /// for the Phase 1 MVP, worth widening later if real use turns up gaps.
-fn windows_scancode(key: KeyCode) -> Option<u16> {
+pub(crate) fn windows_scancode(key: KeyCode) -> Option<u16> {
     const EXT: u16 = 0xE000;
     Some(match key {
         KeyCode::KEY_ESC => 0x01,

@@ -105,6 +105,11 @@ impl VideoDecoder {
         let h264parse = gst::ElementFactory::make("h264parse")
             .build()
             .context("creating h264parse (is gstreamer1-plugins-bad installed?)")?;
+        // Tried avdec_h264 (software decode) hoping to skip VAAPI's GPU round-trip, but it
+        // produced visible frame corruption (stride/buffer-layout mismatch feeding waylandsink,
+        // not a frame-loss artifact — reproduced consistently, not just occasionally). Back to
+        // vah264dec, which decoded cleanly; the release-build + shorter-keyframe-interval wins
+        // stay either way.
         let decoder = gst::ElementFactory::make("vah264dec")
             .build()
             .context("creating vah264dec (is gstreamer1-plugins-bad installed + GST_VA_ALL_DRIVERS set?)")?;
